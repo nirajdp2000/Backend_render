@@ -4472,10 +4472,42 @@ Respond ONLY with this JSON structure (fill every field):
   });
 
   /**
+   * GET /api/stock/quote?symbol=BLOOM
+   * Ultra-fast live price fetch — returns price + pChange in <1s.
+   * Uses Yahoo v8 1d range (no OHLCV history, just meta).
+   */
+  app.get("/api/stock/quote", async (req, res) => {
+    const symbol = String(req.query.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+    // Check perSymbolPriceCache first (5min TTL during market hours)
+    const cached = perSymbolPriceCache.get(symbol);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ symbol, price: cached.price, changePct: cached.changePct, source: 'cache' });
+    }
+
+    // Try Yahoo quote (fast — 1d range, just meta)
+    const quote = await fetchYahooQuote(symbol).catch(() => null);
+    if (quote && quote.price > 0) {
+      const ttl = isMarketDay() ? 5 * 60_000 : 60 * 60_000;
+      perSymbolPriceCache.set(symbol, { ...quote, expiresAt: Date.now() + ttl });
+      return res.json({ symbol, price: quote.price, changePct: quote.changePct, source: 'yahoo' });
+    }
+
+    // Fallback: check OHLCV cache for livePrice
+    const ohlcvCached = realOHLCVCache.get(symbol);
+    if (ohlcvCached?.livePrice) {
+      return res.json({ symbol, price: ohlcvCached.livePrice, changePct: ohlcvCached.changePct, source: 'ohlcv_cache' });
+    }
+
+    return res.status(404).json({ symbol, price: null, changePct: null, source: 'none' });
+  });
+
+  /**
    * GET /api/superbrain/analyze?symbol=BLOOM
    * On-demand Superbrain analysis with LIVE price data.
-   * Called when user expands a stock row — runs fresh with real-time price + OHLCV.
-   * Priority: Yahoo live quote → Upstox market quote → OHLCV last close → 52W midpoint
+   * Fast path: Yahoo quote (price) + cached OHLCV (technicals) + cached fundamentals.
+   * Force-refreshes price every call; uses cached OHLCV if fresh enough.
    */
   app.get("/api/superbrain/analyze", async (req, res) => {
     const symbol = String(req.query.symbol ?? '').toUpperCase().trim();
@@ -4486,33 +4518,56 @@ Respond ONLY with this JSON structure (fill every field):
     const profile = universe.find(p => p.symbol === symbol);
     if (!profile) return res.status(404).json({ error: `Symbol ${symbol} not found in universe` });
 
-    // ── Step 1: Fetch live price + fundamentals in parallel (8s timeout) ──
-    const [yahooResult, screenerResult, ohlcvResult, liveQuoteResult] = await Promise.allSettled([
-      fetchYahooFundamentals(symbol),
-      fetchScreenerFundamentals(symbol),
-      fetchRealOHLCV(symbol),
-      fetchYahooQuote(symbol),
+    // ── Step 1: Fast live price (always fresh, <1s) + fundamentals in parallel ──
+    // fetchYahooQuote: 1d range, just meta — very fast
+    // fetchYahooFundamentals: 5d range, has lastPrice + 52W + PE — medium fast
+    // fetchScreenerFundamentals: HTML scrape — slow, run in background
+    // fetchRealOHLCV: 2yr OHLCV — use cached if available, else skip (too slow for on-demand)
+    const FAST_TIMEOUT = 6000;
+
+    const [quoteResult, yahooResult] = await Promise.allSettled([
+      Promise.race([fetchYahooQuote(symbol), new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
+      Promise.race([fetchYahooFundamentals(symbol), new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
     ]);
 
-    const yahoo = yahooResult.status === 'fulfilled' ? yahooResult.value : null;
-    const screener = screenerResult.status === 'fulfilled' ? screenerResult.value : null;
-    const candles = ohlcvResult.status === 'fulfilled' ? ohlcvResult.value : null;
-    const liveQuote = liveQuoteResult.status === 'fulfilled' ? liveQuoteResult.value : null;
+    // Kick off screener in background (don't wait)
+    fetchScreenerFundamentals(symbol).catch(() => {});
 
-    // ── Step 2: Resolve best available price ──
+    // Use cached OHLCV if available (don't re-fetch 2yr on every click)
+    const cachedOHLCV = realOHLCVCache.get(symbol);
+    const candles = (cachedOHLCV && cachedOHLCV.expiresAt > Date.now()) ? cachedOHLCV.candles : null;
+
+    // If no cached OHLCV, kick off background fetch for next time
+    if (!candles) {
+      warmOHLCVBackground([symbol]);
+    }
+
+    const quote = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
+    const yahoo = yahooResult.status === 'fulfilled' ? yahooResult.value : null;
+
+    // ── Step 2: Resolve best available price (priority: live quote > yahoo > ohlcv cache > ohlcv last close) ──
     const livePrice =
-      liveQuote?.price ??
-      yahoo?.lastPrice ??
-      (realOHLCVCache.get(symbol)?.livePrice ?? null);
+      (quote?.price ?? 0) > 0 ? quote!.price :
+      (yahoo?.lastPrice ?? 0) > 0 ? yahoo!.lastPrice :
+      (cachedOHLCV?.livePrice ?? 0) > 0 ? cachedOHLCV!.livePrice! :
+      null;
 
     const changePct =
-      liveQuote?.changePct ??
+      quote?.changePct ??
       yahoo?.pChange ??
-      (realOHLCVCache.get(symbol)?.changePct ?? null);
+      cachedOHLCV?.changePct ??
+      null;
 
-    const ohlcvEndPrice = candles && candles.length > 0
-      ? candles[candles.length - 1].close
-      : null;
+    // Update perSymbolPriceCache with fresh price
+    if (livePrice && livePrice > 0) {
+      const ttl = isMarketDay() ? 5 * 60_000 : 60 * 60_000;
+      perSymbolPriceCache.set(symbol, { price: livePrice, changePct: changePct ?? 0, expiresAt: Date.now() + ttl });
+    }
+
+    const closes = candles?.map(c => c.close) ?? [];
+    const hasRealOHLCV = candles && candles.length >= 60;
+
+    const ohlcvEndPrice = closes.length > 0 ? closes[closes.length - 1] : null;
 
     const weekHigh52 = yahoo?.weekHigh52 ?? (() => {
       if (!candles || candles.length < 20) return null;
@@ -4525,10 +4580,7 @@ Respond ONLY with this JSON structure (fill every field):
 
     const resolvedPrice = livePrice ?? ohlcvEndPrice;
 
-    // ── Step 3: Compute technical signals from real OHLCV ──
-    const closes = candles?.map(c => c.close) ?? [];
-    const hasRealOHLCV = candles && candles.length >= 60;
-
+    // ── Step 3: Compute technical signals from OHLCV (or defaults) ──
     const buildEmaSimple = (arr: number[], period: number) => {
       const k = 2 / (period + 1);
       return arr.reduce((e, v, i) => i === 0 ? v : e * (1 - k) + v * k, arr[0] ?? 0);
@@ -4543,8 +4595,8 @@ Respond ONLY with this JSON structure (fill every field):
 
     const momentum = (() => {
       if (!hasRealOHLCV) return 1.05;
-      const sixMonthIdx = Math.max(0, closes.length - 126);
-      return closes[sixMonthIdx] > 0 ? closes[closes.length - 1] / closes[sixMonthIdx] : 1.05;
+      const idx = Math.max(0, closes.length - 126);
+      return closes[idx] > 0 ? closes[closes.length - 1] / closes[idx] : 1.05;
     })();
 
     const volatility = (() => {
@@ -4569,15 +4621,12 @@ Respond ONLY with this JSON structure (fill every field):
       if (!hasRealOHLCV || closes.length < 50) return 1.0;
       const ema20 = buildEmaSimple(closes.slice(-20), 20);
       const ema50 = buildEmaSimple(closes.slice(-50), 50);
-      return ema20 > 0 ? ((ema20 - ema50) / ema50) * 100 : 1.0;
+      return ema50 > 0 ? ((ema20 - ema50) / ema50) * 100 : 1.0;
     })();
 
-    const ret30 = hasRealOHLCV && closes.length >= 30
-      ? ((closes[closes.length-1] - closes[closes.length-31]) / closes[closes.length-31]) * 100 : null;
-    const ret90 = hasRealOHLCV && closes.length >= 90
-      ? ((closes[closes.length-1] - closes[closes.length-91]) / closes[closes.length-91]) * 100 : null;
-    const ret180 = hasRealOHLCV && closes.length >= 180
-      ? ((closes[closes.length-1] - closes[closes.length-181]) / closes[closes.length-181]) * 100 : null;
+    const ret30  = hasRealOHLCV && closes.length >= 31  ? ((closes[closes.length-1] - closes[closes.length-31])  / closes[closes.length-31])  * 100 : null;
+    const ret90  = hasRealOHLCV && closes.length >= 91  ? ((closes[closes.length-1] - closes[closes.length-91])  / closes[closes.length-91])  * 100 : null;
+    const ret180 = hasRealOHLCV && closes.length >= 181 ? ((closes[closes.length-1] - closes[closes.length-181]) / closes[closes.length-181]) * 100 : null;
 
     const breakoutFrequency = (() => {
       if (!hasRealOHLCV || closes.length < 20) return 0.1;
@@ -4590,22 +4639,23 @@ Respond ONLY with this JSON structure (fill every field):
     })();
 
     const volumeGrowth = (() => {
-      if (!candles || candles.length < 20) return 1.0;
+      if (!candles || candles.length < 50) return 1.0;
       const recent = candles.slice(-10).reduce((s, c) => s + c.volume, 0) / 10;
-      const base = candles.slice(-50, -10).reduce((s, c) => s + c.volume, 0) / 40;
+      const base   = candles.slice(-50, -10).reduce((s, c) => s + c.volume, 0) / 40;
       return base > 0 ? recent / base : 1.0;
     })();
 
-    // ── Step 4: Build enriched data for fundamental score ──
+    // ── Step 4: Fundamentals ──
     const enrichedData = getEnrichedFromCache(symbol);
+    const screener = enrichedData?.screener ?? null;
     const fundamentalScore = enrichedData ? computeFundamentalScore(enrichedData) : null;
 
-    const dataSource: 'real' | 'synthetic' = (livePrice || hasRealOHLCV) ? 'real' : 'synthetic';
+    const dataSource: 'real' | 'synthetic' = (resolvedPrice != null || hasRealOHLCV) ? 'real' : 'synthetic';
     const dataQuality: 'HIGH' | 'MEDIUM' | 'LOW' =
       (yahoo && screener) ? 'HIGH' :
       (yahoo || hasRealOHLCV) ? 'MEDIUM' : 'LOW';
 
-    // ── Step 5: Run Superbrain with all real data ──
+    // ── Step 5: Run Superbrain ──
     const sbInput: SuperbrainInput = {
       symbol,
       sector: profile.sector,
@@ -4617,8 +4667,8 @@ Respond ONLY with this JSON structure (fill every field):
       maxDrawdown,
       breakoutFrequency,
       volumeGrowth,
-      gradientBoostProb: 60,
-      finalPredictionScore: 60,
+      gradientBoostProb: hasRealOHLCV ? Math.min(90, 50 + breakoutFrequency * 200) : 60,
+      finalPredictionScore: hasRealOHLCV ? Math.min(90, 50 + (momentum - 1) * 40 + trendStrength * 2) : 60,
       rlAction: momentum >= 1.1 && trendStrength > 0 ? 'BUY' : momentum < 0.95 ? 'SELL' : 'HOLD',
       orderImbalance: volumeGrowth > 1.5 ? 2.0 : 1.2,
       vwapDistance: resolvedPrice && candles && candles.length >= 50
@@ -4636,7 +4686,7 @@ Respond ONLY with this JSON structure (fill every field):
       profitGrowth3yr: screener?.profitGrowth3yr ?? null,
       salesGrowth3yr: screener?.salesGrowth3yr ?? null,
       fundamentalScore,
-      sentimentScore: 50 + (momentum - 1) * 30,
+      sentimentScore: Math.min(85, Math.max(20, 50 + (momentum - 1) * 30 + (changePct ?? 0) * 2)),
       newsHeadlines: enrichedData?.newsHeadlines ?? [],
       pChange: changePct,
       dataQuality,
@@ -4649,8 +4699,8 @@ Respond ONLY with this JSON structure (fill every field):
       ret30,
       ret90,
       ret180,
-      bullishScore: 60,
-      relativeStrength: 50,
+      bullishScore: hasRealOHLCV ? Math.min(90, 50 + (momentum - 1) * 30 + trendStrength) : 60,
+      relativeStrength: ret90 != null ? Math.min(100, Math.max(0, 50 + ret90)) : 50,
       stabilityScore: Math.max(0, 100 - maxDrawdown),
     };
 

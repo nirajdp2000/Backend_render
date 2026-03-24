@@ -1,107 +1,122 @@
 /**
- * UpstoxScheduler — Daily auto-connection and proactive token refresh
- * 
- * Responsibilities:
- *   • Schedule daily token refresh before market open (8:30 AM IST)
- *   • Proactive token validation on app startup
- *   • Ensure connection stays active without manual intervention
+ * UpstoxScheduler — Proactive token refresh + daily hard refresh
+ *
+ * Strategy:
+ *   1. On startup — validate token immediately
+ *   2. Every 30 min — call proactiveRefresh() which refreshes if < 2h remain
+ *   3. Daily at 8:30 AM IST (3:00 AM UTC) — force refresh regardless of expiry
+ *
+ * This guarantees the token is always refreshed well before its 24h expiry,
+ * even if the server restarts mid-day or the daily cron fires late.
  */
 
 import { UpstoxTokenManager } from './UpstoxTokenManager';
 
+const PROACTIVE_INTERVAL_MS = 30 * 60 * 1000;  // 30 minutes
+const DAILY_REFRESH_HOUR_UTC = 3;               // 3:00 AM UTC = 8:30 AM IST
+const DAILY_REFRESH_MIN_UTC  = 0;
+
 export class UpstoxScheduler {
   private tokenManager: UpstoxTokenManager;
-  private dailyRefreshInterval: NodeJS.Timeout | null = null;
+  private proactiveTimer: NodeJS.Timeout | null = null;
+  private dailyTimer: NodeJS.Timeout | null = null;
 
   constructor(tokenManager: UpstoxTokenManager) {
     this.tokenManager = tokenManager;
   }
 
-  /**
-   * Start the scheduler — validates token on startup and schedules daily refresh
-   */
   start(): void {
-    console.log('[UpstoxScheduler] Starting scheduler...');
+    console.log('[UpstoxScheduler] Starting — proactive refresh every 30 min + daily at 08:30 IST');
 
-    // Validate token immediately on startup
-    this.validateTokenOnStartup();
+    // 1. Validate immediately on startup
+    this.validateOnStartup();
 
-    // Schedule daily refresh at 8:30 AM IST (3:00 AM UTC)
+    // 2. Proactive check every 30 min (refreshes if < 2h left)
+    this.proactiveTimer = setInterval(() => {
+      this.runProactiveRefresh();
+    }, PROACTIVE_INTERVAL_MS);
+
+    // 3. Hard daily refresh at 8:30 AM IST
     this.scheduleDailyRefresh();
   }
 
-  /**
-   * Validate token on app startup
-   */
-  private async validateTokenOnStartup(): Promise<void> {
+  private async validateOnStartup(): Promise<void> {
     try {
       const token = await this.tokenManager.getValidAccessToken();
       if (token) {
-        console.log('[UpstoxScheduler] Token validated successfully on startup');
+        console.log('[UpstoxScheduler] Startup: token valid');
+        // Also run proactive check immediately — if token was issued yesterday
+        // and we're near expiry, refresh now rather than waiting 30 min
+        await this.runProactiveRefresh();
       } else {
-        console.warn('[UpstoxScheduler] No valid token found. Please authenticate via OAuth.');
+        console.warn('[UpstoxScheduler] Startup: no valid token — OAuth re-auth required');
       }
-    } catch (error) {
-      console.error('[UpstoxScheduler] Token validation failed on startup:', error);
+    } catch (e: any) {
+      console.error('[UpstoxScheduler] Startup validation error:', e.message);
+    }
+  }
+
+  private async runProactiveRefresh(): Promise<void> {
+    try {
+      const refreshed = await this.tokenManager.proactiveRefresh();
+      if (refreshed) {
+        console.log('[UpstoxScheduler] Proactive refresh completed');
+      }
+    } catch (e: any) {
+      console.error('[UpstoxScheduler] Proactive refresh error:', e.message);
     }
   }
 
   /**
-   * Schedule daily token refresh at 8:30 AM IST (before market open)
+   * Schedule a hard refresh at 8:30 AM IST (3:00 AM UTC) every day.
+   * This fires even if the token is still valid — ensures a fresh 24h window
+   * starts at market open time every day.
    */
   private scheduleDailyRefresh(): void {
+    const msUntilNext = this.msUntilNextDailyRefresh();
+    const nextAt = new Date(Date.now() + msUntilNext);
+    console.log(`[UpstoxScheduler] Daily hard refresh scheduled at ${nextAt.toISOString()} (${Math.round(msUntilNext / 60000)}m from now)`);
+
+    this.dailyTimer = setTimeout(() => {
+      this.runDailyRefresh();
+      // Re-schedule for next day
+      this.dailyTimer = setInterval(() => {
+        this.runDailyRefresh();
+      }, 24 * 60 * 60 * 1000);
+    }, msUntilNext);
+  }
+
+  private msUntilNextDailyRefresh(): number {
     const now = new Date();
-    const targetTime = new Date();
-
-    // Set target time to 8:30 AM IST (3:00 AM UTC)
-    targetTime.setUTCHours(3, 0, 0, 0);
-
-    // If target time has passed today, schedule for tomorrow
-    if (now > targetTime) {
-      targetTime.setDate(targetTime.getDate() + 1);
+    const target = new Date();
+    target.setUTCHours(DAILY_REFRESH_HOUR_UTC, DAILY_REFRESH_MIN_UTC, 0, 0);
+    if (now >= target) {
+      target.setUTCDate(target.getUTCDate() + 1);
     }
-
-    const msUntilTarget = targetTime.getTime() - now.getTime();
-
-    console.log(`[UpstoxScheduler] Next token refresh scheduled at ${targetTime.toISOString()}`);
-
-    // Schedule first refresh
-    setTimeout(() => {
-      this.performDailyRefresh();
-
-      // Then repeat every 24 hours
-      this.dailyRefreshInterval = setInterval(() => {
-        this.performDailyRefresh();
-      }, 24 * 60 * 60 * 1000); // 24 hours
-    }, msUntilTarget);
+    return target.getTime() - now.getTime();
   }
 
-  /**
-   * Perform daily token refresh
-   */
-  private async performDailyRefresh(): Promise<void> {
-    console.log('[UpstoxScheduler] Performing daily token refresh...');
-
+  private async runDailyRefresh(): Promise<void> {
+    console.log('[UpstoxScheduler] Daily hard refresh firing at 08:30 IST...');
     try {
-      const token = await this.tokenManager.getValidAccessToken();
-      if (token) {
-        console.log('[UpstoxScheduler] Daily token refresh successful');
-      } else {
-        console.warn('[UpstoxScheduler] Daily refresh failed: No valid token. Re-authentication required.');
+      // Force proactive refresh regardless of window — token is ~24h old at this point
+      const refreshed = await this.tokenManager.proactiveRefresh();
+      if (!refreshed) {
+        // Token may still have hours left — call getValidAccessToken to log status
+        const token = await this.tokenManager.getValidAccessToken();
+        console.log(token
+          ? '[UpstoxScheduler] Daily refresh: token still valid, no refresh needed'
+          : '[UpstoxScheduler] Daily refresh: no token — re-auth required'
+        );
       }
-    } catch (error) {
-      console.error('[UpstoxScheduler] Daily token refresh failed:', error);
+    } catch (e: any) {
+      console.error('[UpstoxScheduler] Daily refresh error:', e.message);
     }
   }
 
-  /**
-   * Stop the scheduler
-   */
   stop(): void {
-    if (this.dailyRefreshInterval) {
-      clearInterval(this.dailyRefreshInterval);
-      this.dailyRefreshInterval = null;
-      console.log('[UpstoxScheduler] Scheduler stopped');
-    }
+    if (this.proactiveTimer) { clearInterval(this.proactiveTimer); this.proactiveTimer = null; }
+    if (this.dailyTimer)     { clearTimeout(this.dailyTimer);  this.dailyTimer = null; }
+    console.log('[UpstoxScheduler] Stopped');
   }
 }

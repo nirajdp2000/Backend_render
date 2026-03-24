@@ -2708,22 +2708,44 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
         // Profile fetch failed, but still authenticated
       }
     }
-    
+
+    // Expose token expiry info for monitoring
+    const tokenInfo = await upstoxService.tokenManager.getTokenInfo();
+
     res.json({
       connected: isAuthenticated,
       isAuthenticated,
       dataSource: isAuthenticated ? 'live' : 'simulated',
-      message: isAuthenticated 
-        ? 'Connected to Upstox. All tabs using live market data.' 
+      message: isAuthenticated
+        ? 'Connected to Upstox. All tabs using live market data.'
         : 'Not connected. Using simulated data. Authenticate to get live data.',
       userInfo,
+      tokenExpiry: tokenInfo,
       features: {
         liveQuotes: isAuthenticated,
         historicalData: isAuthenticated,
         portfolio: isAuthenticated,
-        orders: isAuthenticated
-      }
+        orders: isAuthenticated,
+      },
     });
+  }));
+
+  /**
+   * POST /api/upstox/token-refresh
+   * Manually trigger a proactive token refresh (admin use / monitoring)
+   */
+  app.post("/api/upstox/token-refresh", withErrorBoundary(async (req, res) => {
+    const secret = req.headers['x-admin-secret'] || req.query.secret;
+    if (secret !== (process.env.ADMIN_SECRET || 'stockpulse-eod')) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    try {
+      const refreshed = await upstoxService.tokenManager.proactiveRefresh();
+      const info = await upstoxService.tokenManager.getTokenInfo();
+      res.json({ refreshed, tokenInfo: info });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   }));
 
   /**

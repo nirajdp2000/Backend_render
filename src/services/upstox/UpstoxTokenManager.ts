@@ -6,9 +6,11 @@
  *   2. SQLite    — local dev / Railway / Render (writable filesystem)
  *   3. Memory    — last resort; token lost on process restart / cold start
  *
- * Env-var seed: UPSTOX_ACCESS_TOKEN is always checked as a final fallback
- * so a manually-pasted token in the Vercel dashboard keeps working even
- * without Supabase.
+ * Auto-refresh strategy:
+ *   - Upstox access tokens expire in 24h (86400s)
+ *   - We proactively refresh when < 2h remain (called every 30 min by UpstoxScheduler)
+ *   - On expiry (< 5 min buffer), refresh is also triggered on every getValidAccessToken() call
+ *   - refresh_token grant is used when available; otherwise re-auth is required
  */
 
 import axios from 'axios';
@@ -35,7 +37,7 @@ let sqliteInitialized = false;
 function getSqliteDb(): SqliteDB | null {
   if (sqliteInitialized) return sqliteDb;
   sqliteInitialized = true;
-  if (process.env.VERCEL) return null; // no native bindings on Vercel
+  if (process.env.VERCEL) return null;
   try {
     const _require = createRequire(import.meta.url);
     const Database = _require('better-sqlite3');
@@ -104,7 +106,6 @@ async function writeRecord(r: TokenRecord): Promise<void> {
   const sb = getSupabaseClient();
   if (sb) {
     try {
-      // Delete old rows then insert fresh (single-row table pattern)
       await sb.from('upstox_tokens').delete().neq('id', 0);
       const { error } = await sb.from('upstox_tokens').insert({
         access_token: r.access_token,
@@ -115,6 +116,7 @@ async function writeRecord(r: TokenRecord): Promise<void> {
       });
       if (!error) {
         console.log('[UpstoxTokenManager] Token written to Supabase');
+        memoryToken = r; // keep memory in sync
         return;
       }
       console.error('[UpstoxTokenManager] Supabase write error:', error.message);
@@ -130,6 +132,7 @@ async function writeRecord(r: TokenRecord): Promise<void> {
     db.prepare(
       'INSERT INTO upstox_tokens (access_token, refresh_token, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
     ).run(r.access_token, r.refresh_token, r.expires_at, now, now);
+    memoryToken = r;
     return;
   }
 
@@ -141,8 +144,6 @@ async function writeRecord(r: TokenRecord): Promise<void> {
 
 export class UpstoxTokenManager {
   constructor() {
-    // Seed from env var synchronously into memory so the first sync read works.
-    // The async writeRecord will persist it to Supabase/SQLite on next call.
     const envToken = process.env.UPSTOX_ACCESS_TOKEN;
     if (envToken && envToken !== 'your_token_here' && envToken.length > 20 && !memoryToken) {
       const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
@@ -157,22 +158,31 @@ export class UpstoxTokenManager {
     console.log(`[UpstoxTokenManager] Tokens stored | expires=${new Date(expiresAt).toISOString()} | len=${accessToken.length}`);
   }
 
+  /** True when token is within 5-min of expiry (hard expiry guard) */
   private isExpired(expiresAt: number): boolean {
-    return Date.now() >= expiresAt - 5 * 60 * 1000; // 5-min buffer
+    return Date.now() >= expiresAt - 5 * 60 * 1000;
   }
 
-  private async refreshAccessToken(refreshToken: string, redirectUriOverride?: string): Promise<void> {
-    const clientId = process.env.UPSTOX_CLIENT_ID || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
+  /** True when token expires within the proactive window (default 2h) */
+  isExpiringSoon(expiresAt: number, windowMs = 2 * 60 * 60 * 1000): boolean {
+    return Date.now() >= expiresAt - windowMs;
+  }
+
+  async refreshAccessToken(refreshToken: string, redirectUriOverride?: string): Promise<void> {
+    const clientId     = process.env.UPSTOX_CLIENT_ID     || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
     const clientSecret = process.env.UPSTOX_CLIENT_SECRET || 'tqfd41uqib';
-    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
+    const redirectUri  = redirectUriOverride
+      || process.env.UPSTOX_REDIRECT_URI
+      || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
+
     if (!clientId || !clientSecret || !redirectUri) throw new Error('Upstox credentials not configured');
 
     const params = new URLSearchParams({
-      grant_type: 'refresh_token',
+      grant_type:    'refresh_token',
       refresh_token: refreshToken,
-      client_id: clientId,
+      client_id:     clientId,
       client_secret: clientSecret,
-      redirect_uri: redirectUri,
+      redirect_uri:  redirectUri,
     });
 
     const { data } = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, {
@@ -183,6 +193,41 @@ export class UpstoxTokenManager {
     if (!access_token) throw new Error('No access_token in refresh response');
     await this.storeTokens(access_token, newRefresh || refreshToken, expires_in || 86400);
     console.log('[UpstoxTokenManager] Token refreshed successfully');
+  }
+
+  /**
+   * Proactive refresh — call this on a schedule (every 30 min).
+   * Refreshes if token expires within 2 hours.
+   * Returns true if a refresh was attempted.
+   */
+  async proactiveRefresh(): Promise<boolean> {
+    const record = await readRecord();
+    if (!record) {
+      console.log('[UpstoxTokenManager] Proactive refresh: no token stored');
+      return false;
+    }
+
+    const minsLeft = Math.round((record.expires_at - Date.now()) / 60000);
+
+    if (!this.isExpiringSoon(record.expires_at)) {
+      console.log(`[UpstoxTokenManager] Proactive refresh: token healthy (${minsLeft}m left) — skipping`);
+      return false;
+    }
+
+    console.log(`[UpstoxTokenManager] Proactive refresh triggered — ${minsLeft}m until expiry`);
+
+    if (record.refresh_token) {
+      try {
+        await this.refreshAccessToken(record.refresh_token);
+        console.log('[UpstoxTokenManager] Proactive refresh: SUCCESS');
+        return true;
+      } catch (e: any) {
+        console.error('[UpstoxTokenManager] Proactive refresh failed:', e.message);
+      }
+    } else {
+      console.warn('[UpstoxTokenManager] Proactive refresh: no refresh_token — manual re-auth required');
+    }
+    return false;
   }
 
   async getValidAccessToken(): Promise<string | null> {
@@ -201,17 +246,16 @@ export class UpstoxTokenManager {
       return null;
     }
 
-    // ── Expired ───────────────────────────────────────────────────────────────
+    // ── Expired (hard guard) ──────────────────────────────────────────────────
     if (this.isExpired(record.expires_at)) {
       if (record.refresh_token) {
         try {
           await this.refreshAccessToken(record.refresh_token);
           return (await readRecord())?.access_token || null;
         } catch (e) {
-          console.error('[UpstoxTokenManager] Auto-refresh failed:', e);
+          console.error('[UpstoxTokenManager] Auto-refresh on expiry failed:', e);
         }
       }
-      // Env var fallback
       const envToken = process.env.UPSTOX_ACCESS_TOKEN;
       if (envToken && envToken !== 'your_token_here' && envToken.length > 20) {
         console.log('[UpstoxTokenManager] Expired — falling back to UPSTOX_ACCESS_TOKEN env var');
@@ -229,15 +273,18 @@ export class UpstoxTokenManager {
   }
 
   async exchangeAuthorizationCode(code: string, redirectUriOverride?: string): Promise<void> {
-    const clientId = process.env.UPSTOX_CLIENT_ID || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
+    const clientId     = process.env.UPSTOX_CLIENT_ID     || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
     const clientSecret = process.env.UPSTOX_CLIENT_SECRET || 'tqfd41uqib';
-    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
+    const redirectUri  = redirectUriOverride
+      || process.env.UPSTOX_REDIRECT_URI
+      || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
+
     if (!clientId || !clientSecret || !redirectUri) throw new Error('Upstox credentials not configured');
 
     const params = new URLSearchParams({
-      grant_type: 'authorization_code',
+      grant_type:   'authorization_code',
       code,
-      client_id: clientId,
+      client_id:    clientId,
       client_secret: clientSecret,
       redirect_uri: redirectUri,
     });
@@ -253,4 +300,16 @@ export class UpstoxTokenManager {
   }
 
   close(): void { /* no-op */ }
+
+  /** Returns token expiry info for monitoring endpoints */
+  async getTokenInfo(): Promise<{ expiresAt: string; minsLeft: number; expiringSoon: boolean } | null> {
+    const record = await readRecord();
+    if (!record) return null;
+    const minsLeft = Math.round((record.expires_at - Date.now()) / 60000);
+    return {
+      expiresAt:    new Date(record.expires_at).toISOString(),
+      minsLeft,
+      expiringSoon: this.isExpiringSoon(record.expires_at),
+    };
+  }
 }

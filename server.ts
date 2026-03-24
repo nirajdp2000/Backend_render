@@ -1634,7 +1634,8 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     // Cache key based on request params
     const cacheKey = JSON.stringify(request);
     const cached = ultraQuantCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cached.payload;
+    // Don't serve cached result if it was built on fallback universe
+    if (cached && cached.expiresAt > Date.now() && cached.universeSize > 440) return cached.payload;
 
     // If universe is still at fallback size, wait up to 8s for Supabase to load
     if (!_universeState.universe || _universeState.universe.length <= 440) {
@@ -1778,7 +1779,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     };
 
     // Cache: 5min always — avoid thrashing when Supabase has no data yet
-    ultraQuantCache.set(cacheKey, { expiresAt: Date.now() + ULTRA_QUANT_CACHE_TTL, payload: dashboard });
+    ultraQuantCache.set(cacheKey, { expiresAt: Date.now() + ULTRA_QUANT_CACHE_TTL, payload: dashboard, universeSize: rawUniverse.length });
 
     return dashboard;
   };
@@ -4051,15 +4052,8 @@ Respond ONLY with this JSON structure (fill every field):
    */
   const buildMultibaggerScan = async (cycleDays: MultibaggerCycle) => {
     const cached = multibaggerCache.get(cycleDays);
-    if (cached && cached.expiresAt > Date.now()) return cached.payload;
-
-    // If universe is still at fallback size, wait up to 8s for Supabase to load
-    if (!_universeState.universe || _universeState.universe.length <= 440) {
-      await Promise.race([
-        loadSupabaseUniverse(8000),
-        new Promise<void>(r => setTimeout(r, 8000)),
-      ]);
-    }
+    // Don't serve cached result if it was built on fallback universe
+    if (cached && cached.expiresAt > Date.now() && cached.scannedUniverse > 440) return cached.payload;
 
     const weights  = MB_CYCLE_WEIGHTS[cycleDays];
     const fullUniverse = createUltraQuantUniverse();
@@ -4295,7 +4289,7 @@ Respond ONLY with this JSON structure (fill every field):
     };
 
     // Cache: always use full TTL — avoid thrashing when Supabase has no data yet
-    multibaggerCache.set(cycleDays, { expiresAt: Date.now() + MULTIBAGGER_CACHE_TTL[cycleDays], payload });
+    multibaggerCache.set(cycleDays, { expiresAt: Date.now() + MULTIBAGGER_CACHE_TTL[cycleDays], payload, scannedUniverse: fullUniverse.length });
 
     return payload;
   };

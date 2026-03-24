@@ -6297,8 +6297,8 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     const volFactor  = price > 0 ? Math.min(0.35, (atr / price) * 7) : 0;
     const confidence = Math.max(55, Math.min(95, Math.round(Math.abs(score) * 180 * (1 - volFactor) * agreement)));
 
-    if (confidence < 58) return null;
-    if (agreeing < 4) return null;
+    if (confidence < 55) return null;
+    if (agreeing < 3) return null;
 
     const parts: string[] = [];
     if (rsi > 65)       parts.push(`RSI ${rsi.toFixed(0)} strong`);
@@ -6450,20 +6450,18 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       }
       console.log(`[PredictionScan] Real: ${realCount}, Synthetic: ${syntheticCount}`);
 
-      bullish.sort((a, b) => {
-        // Real data always ranks above synthetic
-        if (a.dataSource === 'real' && b.dataSource !== 'real') return -1;
-        if (b.dataSource === 'real' && a.dataSource !== 'real') return 1;
-        return b.confidence - a.confidence;
-      });
-      bearish.sort((a, b) => {
-        if (a.dataSource === 'real' && b.dataSource !== 'real') return -1;
-        if (b.dataSource === 'real' && a.dataSource !== 'real') return 1;
-        return b.confidence - a.confidence;
-      });
+      // Sort each group by confidence descending
+      const sortByConf = (a: any, b: any) => b.confidence - a.confidence;
+      const realBullish = bullish.filter(x => x.dataSource === 'real').sort(sortByConf);
+      const synthBullish = bullish.filter(x => x.dataSource !== 'real').sort(sortByConf);
+      const realBearish = bearish.filter(x => x.dataSource === 'real').sort(sortByConf);
+      const synthBearish = bearish.filter(x => x.dataSource !== 'real').sort(sortByConf);
 
-      const topBullish = bullish.slice(0, 20);
-      const topBearish = bearish.slice(0, 20);
+      // Real stocks always fill first — synthetic only fills remaining slots
+      const topBullish = [...realBullish, ...synthBullish].slice(0, 20);
+      const topBearish = [...realBearish, ...synthBearish].slice(0, 20);
+
+      console.log(`[PredictionScan] Top picks — real bullish: ${realBullish.length}, real bearish: ${realBearish.length}`);
 
       // Set cache immediately so live tab always works
       predCache = {

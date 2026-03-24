@@ -6357,57 +6357,92 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       const universe = await getUniverseAsync();
       if (universe.length === 0) { predRunning = false; return; }
 
-      // ── Step 1: Pick top 80 by market cap — fetch real Yahoo candles for these ──
-      // fetchRealOHLCV hits Yahoo Finance v8 directly (2yr daily candles).
-      // Batches of 15 with minimal pause — top 80 covers most high-quality picks.
-      const top80 = universe
-        .slice().sort((a: any, b: any) => (b.marketCap || 0) - (a.marketCap || 0))
-        .slice(0, 80);
+      // ── Step 1: Build a priority fetch list ──
+      // Use well-known NIFTY 100 symbols that Yahoo Finance reliably has data for,
+      // supplemented by any symbols already warm in realOHLCVCache.
+      const NIFTY100 = [
+        'RELIANCE','TCS','HDFCBANK','BHARTIARTL','ICICIBANK','INFOSYS','SBIN','HINDUNILVR',
+        'ITC','LT','KOTAKBANK','AXISBANK','BAJFINANCE','MARUTI','ASIANPAINT','TITAN','WIPRO',
+        'ULTRACEMCO','NESTLEIND','POWERGRID','NTPC','ONGC','COALINDIA','JSWSTEEL','TATASTEEL',
+        'HCLTECH','TECHM','SUNPHARMA','DRREDDY','CIPLA','DIVISLAB','APOLLOHOSP','BAJAJFINSV',
+        'BAJAJ-AUTO','HEROMOTOCO','EICHERMOT','TATACONSUM','BRITANNIA','DABUR','MARICO',
+        'PIDILITIND','BERGEPAINT','HAVELLS','VOLTAS','WHIRLPOOL','MCDOWELL-N','UNITEDSPIRITS',
+        'INDUSINDBK','FEDERALBNK','BANDHANBNK','IDFCFIRSTB','PNB','BANKBARODA','CANBK',
+        'GRASIM','ADANIENT','ADANIPORTS','ADANIGREEN','ADANITRANS','ADANIPOWER',
+        'TATAMOTORS','M&M','TATAPOWER','TRENT','NYKAA','ZOMATO','PAYTM','POLICYBZR',
+        'DMART','IRCTC','LICI','RVNL','IRFC','HUDCO','NHPC','SJVN','RECLTD','PFC',
+        'HDFCLIFE','SBILIFE','ICICIPRULI','MAXHEALTH','FORTIS','MUTHOOTFIN','CHOLAFIN',
+        'SHRIRAMFIN','BAJAJHLDNG','MOTHERSON','BOSCHLTD','CUMMINSIND','SIEMENS','ABB',
+        'BHEL','HAL','BEL','COCHINSHIP','MAZAGON','GRSE','BEML','TIINDIA',
+        'ZYDUSLIFE','TORNTPHARM','LUPIN','AUROPHARMA','GLENMARK','IPCALAB',
+        'OBEROIRLTY','DLF','GODREJPROP','PRESTIGE','PHOENIXLTD','BRIGADE',
+        'INFY','HDFCBANK','WIPRO','MPHASIS','LTIM','PERSISTENT','COFORGE',
+      ];
 
-      const YAHOO_BATCH = 15;
+      // Build symbol→universe entry map for sector/exchange lookup
+      const universeMap = new Map<string, any>();
+      for (const p of universe) universeMap.set(p.symbol, p);
+
+      // Also include any symbols already warm in cache (from other scans)
+      const alreadyWarm = [...realOHLCVCache.entries()]
+        .filter(([, v]) => v.expiresAt > Date.now() && v.candles.length >= 60)
+        .map(([sym]) => sym);
+
+      // Deduplicated fetch list: NIFTY100 first, then warm cache symbols
+      const fetchList = [...new Set([...NIFTY100, ...alreadyWarm])];
+
       let realCount = 0;
       let syntheticCount = 0;
 
-      console.log(`[PredictionScan] Fetching real OHLCV for top ${top80.length} stocks...`);
-      for (let i = 0; i < top80.length; i += YAHOO_BATCH) {
-        const batch = top80.slice(i, i + YAHOO_BATCH);
-        await Promise.allSettled(batch.map(async (p: any) => {
-          const cached = realOHLCVCache.get(p.symbol);
-          if (cached && cached.expiresAt > Date.now() && cached.candles.length >= 60) return; // already warm
-          try { await fetchRealOHLCV(p.symbol); } catch (_e) { /* skip */ }
+      // ── Step 2: Fetch real Yahoo candles for NIFTY100 in parallel batches ──
+      const YAHOO_BATCH = 15;
+      console.log(`[PredictionScan] Fetching real OHLCV for ${NIFTY100.length} NIFTY100 stocks...`);
+      for (let i = 0; i < NIFTY100.length; i += YAHOO_BATCH) {
+        const batch = NIFTY100.slice(i, i + YAHOO_BATCH);
+        await Promise.allSettled(batch.map(async (sym: string) => {
+          const cached = realOHLCVCache.get(sym);
+          if (cached && cached.expiresAt > Date.now() && cached.candles.length >= 60) return;
+          try { await fetchRealOHLCV(sym); } catch (_e) { /* skip */ }
         }));
-        if (i + YAHOO_BATCH < top80.length) await new Promise<void>(r => setTimeout(r, 150));
+        if (i + YAHOO_BATCH < NIFTY100.length) await new Promise<void>(r => setTimeout(r, 200));
       }
-      console.log(`[PredictionScan] OHLCV fetch done. Scanning universe...`);
+      console.log(`[PredictionScan] OHLCV fetch done. Scanning...`);
 
+      // ── Step 3: Scan — real candles only for top picks, synthetic for rest ──
       const bullish: any[] = [];
       const bearish: any[] = [];
-      const BATCH = 500;
 
+      // First pass: real candles only (high quality)
+      for (const sym of fetchList) {
+        try {
+          const cached = realOHLCVCache.get(sym);
+          if (!cached || cached.expiresAt <= Date.now() || cached.candles.length < 60) continue;
+          const realCandles = cached.candles.map((c: any) => ({
+            h: c.high ?? c.h, l: c.low ?? c.l, c: c.close ?? c.c, v: c.volume ?? c.v
+          }));
+          if (cached.livePrice && cached.livePrice > 0) {
+            realCandles[realCandles.length - 1].c = cached.livePrice;
+          }
+          const uEntry = universeMap.get(sym);
+          const result = predictStockFromCandles(sym, uEntry?.sector || 'Diversified', uEntry?.exchange || 'NSE', realCandles);
+          if (!result) continue;
+          realCount++;
+          if (result.prediction === 'Bullish') bullish.push(result);
+          else bearish.push(result);
+        } catch (_e) { /* skip */ }
+      }
+
+      // Second pass: synthetic for remaining universe (fills out the scan count)
+      const BATCH = 500;
       for (let i = 0; i < universe.length; i += BATCH) {
         await new Promise<void>(r => setImmediate(r));
         for (const p of universe.slice(i, i + BATCH)) {
+          if (fetchList.includes(p.symbol)) continue; // already processed above
           try {
-            const cached = realOHLCVCache.get(p.symbol);
-            const hasRealCandles = cached && cached.expiresAt > Date.now() && cached.candles.length >= 60;
-
-            let result: any;
-            if (hasRealCandles) {
-              const realCandles = cached!.candles.map((c: any) => ({
-                h: c.high ?? c.h, l: c.low ?? c.l, c: c.close ?? c.c, v: c.volume ?? c.v
-              }));
-              // Anchor last candle to live price if available
-              const livePrice = cached!.livePrice;
-              if (livePrice && livePrice > 0) {
-                realCandles[realCandles.length - 1].c = livePrice;
-              }
-              result = predictStockFromCandles(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', realCandles);
-              if (result) realCount++;
-            } else {
-              result = predictStock(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', p.averageVolume || 0);
-              if (result) { result.dataSource = 'synthetic'; syntheticCount++; }
-            }
+            const result = predictStock(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', p.averageVolume || 0);
             if (!result) continue;
+            result.dataSource = 'synthetic';
+            syntheticCount++;
             if (result.prediction === 'Bullish') bullish.push(result);
             else bearish.push(result);
           } catch (_e) { /* skip */ }
@@ -6415,8 +6450,17 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       }
       console.log(`[PredictionScan] Real: ${realCount}, Synthetic: ${syntheticCount}`);
 
-      bullish.sort((a, b) => b.confidence - a.confidence);
-      bearish.sort((a, b) => b.confidence - a.confidence);
+      bullish.sort((a, b) => {
+        // Real data always ranks above synthetic
+        if (a.dataSource === 'real' && b.dataSource !== 'real') return -1;
+        if (b.dataSource === 'real' && a.dataSource !== 'real') return 1;
+        return b.confidence - a.confidence;
+      });
+      bearish.sort((a, b) => {
+        if (a.dataSource === 'real' && b.dataSource !== 'real') return -1;
+        if (b.dataSource === 'real' && a.dataSource !== 'real') return 1;
+        return b.confidence - a.confidence;
+      });
 
       const topBullish = bullish.slice(0, 20);
       const topBearish = bearish.slice(0, 20);

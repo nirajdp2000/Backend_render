@@ -4080,7 +4080,6 @@ Respond ONLY with this JSON structure (fill every field):
 
     const weights  = MB_CYCLE_WEIGHTS[cycleDays];
     const fullUniverse = createUltraQuantUniverse();
-
     // ── Pass 0: Pre-load OHLCV from Supabase on cold start (one query, ~50ms) ──
     // Only query top 200 by marketCap — these are the symbols refreshed by EOD batch.
     const mbTop200Symbols = fullUniverse
@@ -4094,7 +4093,11 @@ Respond ONLY with this JSON structure (fill every field):
     }
 
     // ── Pass 1: Ultra-fast pre-sort using deterministic hash — handles 5000+ stocks ──
-    const preScored = fullUniverse.map(p => {
+    // Cap to top 500 by marketCap to keep computation fast on Render free tier
+    const scanUniverse = fullUniverse.length > 500
+      ? fullUniverse.slice().sort((a, b) => b.marketCap - a.marketCap).slice(0, 500)
+      : fullUniverse;
+    const preScored = scanUniverse.map(p => {
       const seed = symbolSeed(p.symbol);
       const sectorBonus = ({ Technology: 8, Healthcare: 7, Financials: 6, Consumer: 5,
         Industrials: 4, Energy: 3, Telecom: 2, Materials: 2 } as Record<string, number>)[p.sector] ?? 3;
@@ -4106,7 +4109,7 @@ Respond ONLY with this JSON structure (fill every field):
     }).sort((a, b) => b.score - a.score);
 
     const top100MBSet = new Set(preScored.slice(0, 100).map(x => x.symbol));
-    const universe = fullUniverse.filter(p => top100MBSet.has(p.symbol));
+    const universe = scanUniverse.filter(p => top100MBSet.has(p.symbol));
 
     // ── Pass 2: Read real OHLCV from cache (populated by Pass 0) ──
     const mbRealOHLCVMap = new Map<string, UltraQuantCandle[] | null>();
@@ -4303,8 +4306,7 @@ Respond ONLY with this JSON structure (fill every field):
 
     const payload = {
       cycle:           cycleDays,
-      scannedUniverse: fullUniverse.length,
-      returned:        top100.length,
+      scannedUniverse: fullUniverse.length,      returned:        top100.length,
       stocks:          top100,
       leadingSector,
       avgBullishScore: Number(avgBullishScore.toFixed(2)),

@@ -59,9 +59,9 @@ export interface SuperbrainInput {
   trendScore?: number;
   relativeStrength?: number;
   stabilityScore?: number;
-  ret30?: number;
-  ret90?: number;
-  ret180?: number;
+  ret30?: number | null;
+  ret90?: number | null;
+  ret180?: number | null;
   dataQuality: 'HIGH' | 'MEDIUM' | 'LOW';
   dataSource: 'real' | 'synthetic';
   // OHLCV candles for pattern recognition (optional, last 60 candles)

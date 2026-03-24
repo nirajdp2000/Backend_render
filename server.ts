@@ -4471,6 +4471,205 @@ Respond ONLY with this JSON structure (fill every field):
     res.json(data);
   });
 
+  /**
+   * GET /api/superbrain/analyze?symbol=BLOOM
+   * On-demand Superbrain analysis with LIVE price data.
+   * Called when user expands a stock row — runs fresh with real-time price + OHLCV.
+   * Priority: Yahoo live quote → Upstox market quote → OHLCV last close → 52W midpoint
+   */
+  app.get("/api/superbrain/analyze", async (req, res) => {
+    const symbol = String(req.query.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+    // Find stock profile from universe
+    const universe = createUltraQuantUniverse();
+    const profile = universe.find(p => p.symbol === symbol);
+    if (!profile) return res.status(404).json({ error: `Symbol ${symbol} not found in universe` });
+
+    // ── Step 1: Fetch live price + fundamentals in parallel (8s timeout) ──
+    const [yahooResult, screenerResult, ohlcvResult, liveQuoteResult] = await Promise.allSettled([
+      fetchYahooFundamentals(symbol),
+      fetchScreenerFundamentals(symbol),
+      fetchRealOHLCV(symbol),
+      fetchYahooQuote(symbol),
+    ]);
+
+    const yahoo = yahooResult.status === 'fulfilled' ? yahooResult.value : null;
+    const screener = screenerResult.status === 'fulfilled' ? screenerResult.value : null;
+    const candles = ohlcvResult.status === 'fulfilled' ? ohlcvResult.value : null;
+    const liveQuote = liveQuoteResult.status === 'fulfilled' ? liveQuoteResult.value : null;
+
+    // ── Step 2: Resolve best available price ──
+    const livePrice =
+      liveQuote?.price ??
+      yahoo?.lastPrice ??
+      (realOHLCVCache.get(symbol)?.livePrice ?? null);
+
+    const changePct =
+      liveQuote?.changePct ??
+      yahoo?.pChange ??
+      (realOHLCVCache.get(symbol)?.changePct ?? null);
+
+    const ohlcvEndPrice = candles && candles.length > 0
+      ? candles[candles.length - 1].close
+      : null;
+
+    const weekHigh52 = yahoo?.weekHigh52 ?? (() => {
+      if (!candles || candles.length < 20) return null;
+      return Number(Math.max(...candles.slice(-252).map(c => c.high)).toFixed(2));
+    })();
+    const weekLow52 = yahoo?.weekLow52 ?? (() => {
+      if (!candles || candles.length < 20) return null;
+      return Number(Math.min(...candles.slice(-252).map(c => c.low)).toFixed(2));
+    })();
+
+    const resolvedPrice = livePrice ?? ohlcvEndPrice;
+
+    // ── Step 3: Compute technical signals from real OHLCV ──
+    const closes = candles?.map(c => c.close) ?? [];
+    const hasRealOHLCV = candles && candles.length >= 60;
+
+    const buildEmaSimple = (arr: number[], period: number) => {
+      const k = 2 / (period + 1);
+      return arr.reduce((e, v, i) => i === 0 ? v : e * (1 - k) + v * k, arr[0] ?? 0);
+    };
+
+    const cagr = (() => {
+      if (!hasRealOHLCV || closes.length < 2) return profile.marketCap > 50000 ? 12 : 8;
+      const years = closes.length / 252;
+      const start = closes[0], end = closes[closes.length - 1];
+      return start > 0 ? (Math.pow(end / start, 1 / Math.max(years, 0.5)) - 1) * 100 : 10;
+    })();
+
+    const momentum = (() => {
+      if (!hasRealOHLCV) return 1.05;
+      const sixMonthIdx = Math.max(0, closes.length - 126);
+      return closes[sixMonthIdx] > 0 ? closes[closes.length - 1] / closes[sixMonthIdx] : 1.05;
+    })();
+
+    const volatility = (() => {
+      if (!hasRealOHLCV || closes.length < 20) return 0.018;
+      const rets = closes.slice(-60).map((c, i, a) => i === 0 ? 0 : (c - a[i-1]) / a[i-1]).slice(1);
+      const mean = rets.reduce((s, r) => s + r, 0) / rets.length;
+      return Math.sqrt(rets.reduce((s, r) => s + (r - mean) ** 2, 0) / rets.length);
+    })();
+
+    const maxDrawdown = (() => {
+      if (!hasRealOHLCV) return 25;
+      let peak = -Infinity, maxDD = 0;
+      for (const c of closes.slice(-252)) {
+        if (c > peak) peak = c;
+        const dd = (peak - c) / peak * 100;
+        if (dd > maxDD) maxDD = dd;
+      }
+      return Number(maxDD.toFixed(1));
+    })();
+
+    const trendStrength = (() => {
+      if (!hasRealOHLCV || closes.length < 50) return 1.0;
+      const ema20 = buildEmaSimple(closes.slice(-20), 20);
+      const ema50 = buildEmaSimple(closes.slice(-50), 50);
+      return ema20 > 0 ? ((ema20 - ema50) / ema50) * 100 : 1.0;
+    })();
+
+    const ret30 = hasRealOHLCV && closes.length >= 30
+      ? ((closes[closes.length-1] - closes[closes.length-31]) / closes[closes.length-31]) * 100 : null;
+    const ret90 = hasRealOHLCV && closes.length >= 90
+      ? ((closes[closes.length-1] - closes[closes.length-91]) / closes[closes.length-91]) * 100 : null;
+    const ret180 = hasRealOHLCV && closes.length >= 180
+      ? ((closes[closes.length-1] - closes[closes.length-181]) / closes[closes.length-181]) * 100 : null;
+
+    const breakoutFrequency = (() => {
+      if (!hasRealOHLCV || closes.length < 20) return 0.1;
+      let hits = 0;
+      for (let i = 20; i < closes.length; i++) {
+        const prevHigh = Math.max(...closes.slice(i - 20, i));
+        if (closes[i] > prevHigh) hits++;
+      }
+      return hits / (closes.length - 20);
+    })();
+
+    const volumeGrowth = (() => {
+      if (!candles || candles.length < 20) return 1.0;
+      const recent = candles.slice(-10).reduce((s, c) => s + c.volume, 0) / 10;
+      const base = candles.slice(-50, -10).reduce((s, c) => s + c.volume, 0) / 40;
+      return base > 0 ? recent / base : 1.0;
+    })();
+
+    // ── Step 4: Build enriched data for fundamental score ──
+    const enrichedData = getEnrichedFromCache(symbol);
+    const fundamentalScore = enrichedData ? computeFundamentalScore(enrichedData) : null;
+
+    const dataSource: 'real' | 'synthetic' = (livePrice || hasRealOHLCV) ? 'real' : 'synthetic';
+    const dataQuality: 'HIGH' | 'MEDIUM' | 'LOW' =
+      (yahoo && screener) ? 'HIGH' :
+      (yahoo || hasRealOHLCV) ? 'MEDIUM' : 'LOW';
+
+    // ── Step 5: Run Superbrain with all real data ──
+    const sbInput: SuperbrainInput = {
+      symbol,
+      sector: profile.sector,
+      marketCap: profile.marketCap,
+      cagr: Number(cagr.toFixed(2)),
+      momentum,
+      trendStrength,
+      volatility,
+      maxDrawdown,
+      breakoutFrequency,
+      volumeGrowth,
+      gradientBoostProb: 60,
+      finalPredictionScore: 60,
+      rlAction: momentum >= 1.1 && trendStrength > 0 ? 'BUY' : momentum < 0.95 ? 'SELL' : 'HOLD',
+      orderImbalance: volumeGrowth > 1.5 ? 2.0 : 1.2,
+      vwapDistance: resolvedPrice && candles && candles.length >= 50
+        ? (() => {
+            const last50 = candles.slice(-50);
+            const vwap = last50.reduce((s, c) => s + c.close * c.volume, 0) / Math.max(1, last50.reduce((s, c) => s + c.volume, 0));
+            return ((resolvedPrice - vwap) / Math.max(vwap, 1)) * 100;
+          })()
+        : undefined,
+      pe: yahoo?.pe ?? screener?.pe ?? null,
+      roe: screener?.roe ?? null,
+      roce: screener?.roce ?? null,
+      debtToEquity: screener?.debtToEquity ?? null,
+      promoterHolding: screener?.promoterHolding ?? null,
+      profitGrowth3yr: screener?.profitGrowth3yr ?? null,
+      salesGrowth3yr: screener?.salesGrowth3yr ?? null,
+      fundamentalScore,
+      sentimentScore: 50 + (momentum - 1) * 30,
+      newsHeadlines: enrichedData?.newsHeadlines ?? [],
+      pChange: changePct,
+      dataQuality,
+      dataSource,
+      candles: candles?.slice(-60).map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })),
+      currentPrice: resolvedPrice ?? null,
+      weekHigh52,
+      weekLow52,
+      ohlcvEndPrice,
+      ret30,
+      ret90,
+      ret180,
+      bullishScore: 60,
+      relativeStrength: 50,
+      stabilityScore: Math.max(0, 100 - maxDrawdown),
+    };
+
+    const superbrain = runSuperbrain(sbInput, resolvedPrice ?? null);
+
+    res.json({
+      symbol,
+      superbrain,
+      livePrice: resolvedPrice,
+      changePct,
+      weekHigh52,
+      weekLow52,
+      dataSource,
+      dataQuality,
+      yahoo,
+      screener,
+    });
+  });
+
   /** GET /api/market/fii-dii — Latest FII/DII net buy/sell from NSE */
   app.get("/api/market/fii-dii", async (req, res) => {
     const data = await fetchFIIDIIData().catch(() => null);

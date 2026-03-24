@@ -67,6 +67,10 @@ export interface SuperbrainInput {
   // OHLCV candles for pattern recognition (optional, last 60 candles)
   candles?: Array<{ open: number; high: number; low: number; close: number; volume: number }>;
   currentPrice?: number | null;
+  // Price fallbacks for target computation when live price unavailable
+  weekHigh52?: number | null;
+  weekLow52?: number | null;
+  ohlcvEndPrice?: number | null;  // last OHLCV candle close (EOD price)
 }
 
 export interface SuperbrainOutput {
@@ -331,6 +335,27 @@ function computeTechnical(inp: SuperbrainInput): number {
   s += inp.orderImbalance >= 2.5 ? 6 : inp.orderImbalance >= 1.5 ? 3 : inp.orderImbalance < 0.8 ? -4 : 0;
   if (inp.vwapDistance != null) s += inp.vwapDistance > 1 ? 4 : inp.vwapDistance < -2 ? -4 : 0;
   if (inp.deliveryPct != null) s += inp.deliveryPct >= 60 ? 6 : inp.deliveryPct >= 40 ? 2 : -3;
+  // Multi-timeframe momentum (ret30/ret90/ret180) — strong signal when all positive
+  if (inp.ret30 != null && inp.ret90 != null && inp.ret180 != null) {
+    const allPositive = inp.ret30 > 0 && inp.ret90 > 0 && inp.ret180 > 0;
+    const allNegative = inp.ret30 < 0 && inp.ret90 < 0 && inp.ret180 < 0;
+    if (allPositive) s += inp.ret30 >= 10 ? 10 : inp.ret30 >= 5 ? 6 : 3;
+    if (allNegative) s -= 8;
+    // Acceleration: short-term > long-term (momentum building)
+    if (inp.ret30 > inp.ret90 && inp.ret90 > 0) s += 5;
+    // Deceleration: short-term < long-term (momentum fading)
+    if (inp.ret30 < 0 && inp.ret90 > 0) s -= 4;
+  } else if (inp.ret90 != null) {
+    s += inp.ret90 >= 15 ? 7 : inp.ret90 >= 5 ? 3 : inp.ret90 < -10 ? -6 : 0;
+  }
+  // Today's price change — strong intraday signal
+  if (inp.pChange != null) {
+    s += inp.pChange >= 3 ? 6 : inp.pChange >= 1 ? 3 : inp.pChange <= -3 ? -6 : inp.pChange <= -1 ? -2 : 0;
+  }
+  // Relative strength bonus
+  if (inp.relativeStrength != null) {
+    s += inp.relativeStrength >= 70 ? 6 : inp.relativeStrength >= 55 ? 2 : inp.relativeStrength < 35 ? -5 : 0;
+  }
   return clamp(s + 10);
 }
 
@@ -475,8 +500,17 @@ function kellyPosition(winProb: number, riskScore: number, superScore: number): 
 
 // ── ATR-based Price Targets ───────────────────────────────────────────────────
 function computeTargets(inp: SuperbrainInput, superScore: number, riskScore: number) {
-  // Only compute targets when we have a real price — never synthesise from market cap
-  const price = inp.currentPrice ?? null;
+  // Price resolution: live price → OHLCV EOD close → 52W midpoint
+  // Never synthesise from market cap — all fallbacks are real historical prices
+  const livePrice = inp.currentPrice ?? null;
+  const eodPrice  = inp.ohlcvEndPrice ?? null;
+  const midPrice  = (inp.weekHigh52 && inp.weekLow52 && inp.weekHigh52 > 0 && inp.weekLow52 > 0)
+    ? Number(((inp.weekHigh52 + inp.weekLow52) / 2).toFixed(2))
+    : null;
+
+  const price = livePrice ?? eodPrice ?? midPrice;
+  const priceSource: 'live' | 'eod' | 'estimated' =
+    livePrice ? 'live' : eodPrice ? 'eod' : midPrice ? 'estimated' : 'none' as any;
 
   if (!price || price <= 0) {
     return { targetPrice: null, stopLoss: null, upside: null };
@@ -496,10 +530,17 @@ function computeTargets(inp: SuperbrainInput, superScore: number, riskScore: num
 
   // Blend with CAGR-based target for real data
   let finalTarget = targetPrice;
-  if (inp.dataSource === 'real' && inp.cagr >= 5 && inp.cagr <= 80) {
+  const isRealPrice = priceSource === 'live' || priceSource === 'eod';
+  if (isRealPrice && inp.cagr >= 5 && inp.cagr <= 80) {
     const holdMonths = superScore >= 75 ? 12 : superScore >= 60 ? 9 : 6;
     const cagrTarget = price * (1 + (inp.cagr / 100) * holdMonths / 12);
     finalTarget = Number(lerp(targetPrice, cagrTarget, 0.35).toFixed(2));
+  }
+
+  // For 52W midpoint estimates, use a tighter ATR multiplier (less confident)
+  if (priceSource === 'estimated') {
+    const conservativeMult = superScore >= 70 ? 2.5 : superScore >= 55 ? 1.8 : 1.2;
+    finalTarget = Number((price + atr * conservativeMult).toFixed(2));
   }
 
   const upside = Number(((finalTarget - price) / price * 100).toFixed(1));

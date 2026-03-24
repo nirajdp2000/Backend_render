@@ -1438,6 +1438,18 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
           pChange: enrichedData?.yahoo?.pChange ?? ohlcvChangePct ?? null,
           dataQuality: resolvedDataQuality,
           dataSource: resolvedDataSource,
+          // Price fallbacks for target computation
+          weekHigh52: enrichedData?.yahoo?.weekHigh52 ?? (() => {
+            if (!realCandles || realCandles.length < 20) return null;
+            return Number(Math.max(...realCandles.slice(-252).map(c => c.high)).toFixed(2));
+          })(),
+          weekLow52: enrichedData?.yahoo?.weekLow52 ?? (() => {
+            if (!realCandles || realCandles.length < 20) return null;
+            return Number(Math.min(...realCandles.slice(-252).map(c => c.low)).toFixed(2));
+          })(),
+          ohlcvEndPrice: realCandles && realCandles.length >= 1
+            ? Number(realCandles[realCandles.length - 1].close.toFixed(2))
+            : null,
         }, resolvedPrice);
 
         // Sync rlAction with Superbrain decision so both signals always agree
@@ -4368,6 +4380,20 @@ Respond ONLY with this JSON structure (fill every field):
           ret180: momentumResults[i].ret180 * 100,
           dataQuality: (enriched?.dataQuality ?? (hasRealOHLCV ? 'MEDIUM' : 'LOW')) as 'HIGH' | 'MEDIUM' | 'LOW',
           dataSource: (enriched?.yahoo ? 'real' : hasRealOHLCV ? 'real' : 'synthetic') as 'real' | 'synthetic',
+          // Price fallbacks for target computation
+          weekHigh52: enriched?.yahoo?.weekHigh52 ?? (() => {
+            const mbCandles = mbRealOHLCVMap.get(profile.symbol);
+            if (!mbCandles || mbCandles.length < 20) return null;
+            return Number(Math.max(...mbCandles.slice(-252).map(c => c.high)).toFixed(2));
+          })(),
+          weekLow52: enriched?.yahoo?.weekLow52 ?? (() => {
+            const mbCandles = mbRealOHLCVMap.get(profile.symbol);
+            if (!mbCandles || mbCandles.length < 20) return null;
+            return Number(Math.min(...mbCandles.slice(-252).map(c => c.low)).toFixed(2));
+          })(),
+          ohlcvEndPrice: hasRealOHLCV
+            ? Number(seriesCache[i].closes[seriesCache[i].closes.length - 1].toFixed(2))
+            : null,
         }, enriched?.yahoo?.lastPrice ?? mbLivePrice ?? (mbCachedPriceValid ? mbCachedPrice!.price : null) ?? (hasRealOHLCV ? seriesCache[i].closes[seriesCache[i].closes.length - 1] : null)),
       };
     });

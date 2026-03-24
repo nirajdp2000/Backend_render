@@ -6696,6 +6696,55 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       const today = new Date().toISOString().split('T')[0];
       const { bullish, bearish } = predCache.data;
       const allTop = [...bullish, ...bearish];
+
+      // Direct Supabase delete + insert with full error reporting
+      const sb = getSupabaseClient();
+      if (sb) {
+        const { error: delErr, count: delCount } = await sb
+          .from('predictions')
+          .delete()
+          .eq('prediction_date', today);
+        if (delErr) {
+          return res.status(500).json({ error: 'Delete failed: ' + delErr.message, code: delErr.code });
+        }
+        console.log(`[ForceSave] Deleted rows for ${today}, count=${delCount}`);
+
+        const rows = allTop.map((r: any) => ({
+          stock_symbol: r.stock,
+          prediction_date: today,
+          target_date: today,
+          prediction: r.prediction,
+          confidence: r.confidence,
+          predicted_price: r.predicted_price,
+          current_price: r.current_price ?? null,
+          sector: r.sector ?? null,
+          signals: {
+            RSI: r.signals.RSI, MACD: r.signals.MACD,
+            Volume: r.signals.Volume, Trend: r.signals.Trend,
+            Sentiment: r.signals.Sentiment, Bollinger: r.signals.Bollinger,
+            Stochastic: r.signals.Stochastic, Acceleration: r.signals.Acceleration,
+            ATR: r.indicators?.atr ?? 0,
+            current_price: r.current_price ?? null,
+            sector: r.sector ?? null,
+          },
+          explanation: r.explanation,
+          created_at: Date.now(),
+        }));
+
+        const { error: insErr } = await sb.from('predictions').insert(rows);
+        if (insErr) {
+          // Retry without top-level current_price/sector
+          console.log('[ForceSave] Insert failed:', insErr.message, '— retrying without top-level columns');
+          const rowsFallback = rows.map(({ current_price, sector, ...rest }: any) => rest);
+          const { error: insErr2 } = await sb.from('predictions').insert(rowsFallback);
+          if (insErr2) {
+            return res.status(500).json({ error: 'Insert failed: ' + insErr2.message, firstError: insErr.message });
+          }
+        }
+        return res.json({ success: true, saved: allTop.length, date: today, deleted: delCount });
+      }
+
+      // Fallback to service
       await PredictionStorageService.saveAllPredictions(today, allTop.map((r: any) => ({
         stock_symbol: r.stock,
         prediction_date: today,

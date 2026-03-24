@@ -18,6 +18,7 @@ import { getSupabaseClient } from "./src/lib/supabase";
 import { fetchNewsIntelligence, getStockSentiment, getTopNews, getSectorSentiment } from "./src/services/NewsIntelligenceService";
 import { enrichStocksBackground, getEnrichedFromCache, fetchFIIDIIData, computeFundamentalScore, fetchYahooFundamentals, fetchScreenerFundamentals, isYahooCached, loadFundamentalsFromSupabase, loadOHLCVFromSupabase, writeOHLCVToSupabase, type EnrichedStockData, type OHLCVCandle } from "./src/services/MarketDataAggregator";
 import { runSuperbrain, type SuperbrainInput } from "./src/services/SuperbrainEngine";
+import { startUniverseSyncScheduler, syncUniverseToSupabase } from "./src/services/UniverseSyncService";
 
 import path from "path";
 import fs from "fs";
@@ -2743,6 +2744,33 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
       const refreshed = await upstoxService.tokenManager.proactiveRefresh();
       const info = await upstoxService.tokenManager.getTokenInfo();
       res.json({ refreshed, tokenInfo: info });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  }));
+
+  /**
+   * POST /api/admin/universe-sync
+   * Manually trigger a full NSE+BSE universe sync to Supabase.
+   * Pass ?force=true to run even on weekends/holidays.
+   */
+  app.post("/api/admin/universe-sync", withErrorBoundary(async (req, res) => {
+    const secret = req.headers['x-admin-secret'] || req.query.secret;
+    if (secret !== (process.env.ADMIN_SECRET || 'stockpulse-eod')) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const force = req.query.force === 'true';
+    try {
+      const result = await syncUniverseToSupabase(force);
+      if (!result.skipped) {
+        // Reload in-memory universe after manual sync
+        _universeState.universe = null;
+        _cachedUniverse = null;
+        ultraQuantCache.clear();
+        multibaggerCache.clear();
+        loadSupabaseUniverse(15000).catch(() => {});
+      }
+      res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -6367,6 +6395,19 @@ async function startServer() {
     initUniverse().catch(err =>
       console.warn('[StockUniverseService] Background init failed:', err.message)
     );
+
+    // Start daily universe sync scheduler (7:00 AM IST, trading days only)
+    startUniverseSyncScheduler((result) => {
+      if (!result.skipped) {
+        console.log(`[UniverseSync] Sync complete — inserted:${result.inserted} deleted:${result.deleted} updated:${result.updated} total:${result.total}`);
+        // Reload in-memory universe so live requests use fresh data
+        _universeState.universe = null;
+        _cachedUniverse = null;
+        ultraQuantCache.clear();
+        multibaggerCache.clear();
+        loadSupabaseUniverse(15000).catch(e => console.warn('[UniverseSync] Post-sync reload failed:', e.message));
+      }
+    });
   });
 
   // Graceful shutdown handler

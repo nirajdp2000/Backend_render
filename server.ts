@@ -17,7 +17,7 @@ import { PredictionStorageService } from "./src/services/PredictionStorageServic
 import { getSupabaseClient } from "./src/lib/supabase";
 import { fetchNewsIntelligence, getStockSentiment, getTopNews, getSectorSentiment } from "./src/services/NewsIntelligenceService";
 import { enrichStocksBackground, getEnrichedFromCache, fetchFIIDIIData, computeFundamentalScore, fetchYahooFundamentals, fetchScreenerFundamentals, isYahooCached, loadFundamentalsFromSupabase, loadOHLCVFromSupabase, writeOHLCVToSupabase, type EnrichedStockData, type OHLCVCandle } from "./src/services/MarketDataAggregator";
-import { runSuperbrain, type SuperbrainInput } from "./src/services/SuperbrainEngine";
+import { runSuperbrain, type SuperbrainInput, resolveOutcomes, getSuperbrainStats } from "./src/services/SuperbrainEngine";
 import { startUniverseSyncScheduler, syncUniverseToSupabase } from "./src/services/UniverseSyncService";
 
 import path from "path";
@@ -2150,6 +2150,11 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
       source: universe.length > 440 ? 'supabase' : 'fallback',
       sample: universe.slice(0, 3).map(s => ({ symbol: s.symbol, name: s.name })),
     });
+  });
+
+  // Superbrain intelligence stats — win rates, sector strength, signal accuracy
+  app.get("/api/debug/superbrain", (_req, res) => {
+    res.json(getSuperbrainStats());
   });
 
   // Debug endpoint — enrichment + OHLCV cache state for top symbols
@@ -6408,6 +6413,10 @@ async function startServer() {
         loadSupabaseUniverse(15000).catch(e => console.warn('[UniverseSync] Post-sync reload failed:', e.message));
       }
     });
+
+    // Resolve Superbrain outcomes daily (checks if past BUY/SELL calls were correct)
+    resolveOutcomes().catch(() => {});
+    setInterval(() => resolveOutcomes().catch(() => {}), 24 * 60 * 60 * 1000);
   });
 
   // Graceful shutdown handler

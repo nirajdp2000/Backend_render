@@ -2554,7 +2554,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
       3. Set <code>UPSTOX_ACCESS_TOKEN</code> = (paste token) for Production<br>
       4. Click Save → Redeploy (or just use the app — it works until next cold start)
     </div>
-    <a href="/" class="go-btn">Go to App →</a>
+    <a href="${process.env.FRONTEND_URL || 'https://radiant-puppy-97d40a.netlify.app'}" class="go-btn">Go to App →</a>
   </div>
 </body>
 </html>`);
@@ -2590,7 +2590,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     <div class="bar-wrap"><div class="bar"></div></div>
     <p class="note">Redirecting you back to the app…</p>
   </div>
-  <script>setTimeout(()=>location.replace('/'),2000)</script>
+  <script>setTimeout(()=>location.replace('${process.env.FRONTEND_URL || 'https://radiant-puppy-97d40a.netlify.app'}'),2000)</script>
 </body>
 </html>`);
       }

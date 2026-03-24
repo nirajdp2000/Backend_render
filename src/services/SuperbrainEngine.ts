@@ -335,6 +335,14 @@ function computeTechnical(inp: SuperbrainInput): number {
   s += inp.orderImbalance >= 2.5 ? 6 : inp.orderImbalance >= 1.5 ? 3 : inp.orderImbalance < 0.8 ? -4 : 0;
   if (inp.vwapDistance != null) s += inp.vwapDistance > 1 ? 4 : inp.vwapDistance < -2 ? -4 : 0;
   if (inp.deliveryPct != null) s += inp.deliveryPct >= 60 ? 6 : inp.deliveryPct >= 40 ? 2 : -3;
+  // 52W range position — price near 52W high is bullish, near low is bearish
+  if (inp.currentPrice != null && inp.weekHigh52 != null && inp.weekLow52 != null) {
+    const range = inp.weekHigh52 - inp.weekLow52;
+    if (range > 0) {
+      const pos = (inp.currentPrice - inp.weekLow52) / range; // 0=at low, 1=at high
+      s += pos >= 0.85 ? 8 : pos >= 0.65 ? 4 : pos >= 0.45 ? 0 : pos >= 0.25 ? -4 : -8;
+    }
+  }
   // Multi-timeframe momentum (ret30/ret90/ret180) — strong signal when all positive
   if (inp.ret30 != null && inp.ret90 != null && inp.ret180 != null) {
     const allPositive = inp.ret30 > 0 && inp.ret90 > 0 && inp.ret180 > 0;
@@ -551,18 +559,55 @@ function computeTargets(inp: SuperbrainInput, superScore: number, riskScore: num
 function buildExplanation(inp: SuperbrainInput, signals: SuperbrainOutput['signals'],
   decision: SuperbrainDecision, regime: string, patterns: string[]): string[] {
   const r: string[] = [];
-  if (signals.technical >= 70) r.push(`Strong technical: ${inp.cagr.toFixed(1)}% CAGR, momentum ${((inp.momentum-1)*100).toFixed(1)}% above base`);
-  else if (signals.technical <= 35) r.push(`Weak technical: drawdown ${inp.maxDrawdown.toFixed(1)}%, momentum ${((inp.momentum-1)*100).toFixed(1)}%`);
-  if (signals.fundamental >= 70 && inp.dataQuality !== 'LOW') r.push(`Quality fundamentals: ROE ${inp.roe?.toFixed(1) ?? 'N/A'}%, D/E ${inp.debtToEquity?.toFixed(2) ?? 'N/A'}, PE ${inp.pe?.toFixed(1) ?? 'N/A'}x`);
-  else if (signals.fundamental <= 35 && inp.pe != null) r.push(`Valuation stretched: PE ${inp.pe.toFixed(1)}x vs fair ${SECTOR_PE_FAIR[inp.sector] ?? 22}x`);
+
+  // Technical signal — always include something meaningful
+  if (signals.technical >= 70) {
+    r.push(`Strong technical: ${inp.cagr.toFixed(1)}% CAGR, momentum ${((inp.momentum-1)*100).toFixed(1)}% above base`);
+  } else if (signals.technical <= 35) {
+    r.push(`Weak technical: drawdown ${inp.maxDrawdown.toFixed(1)}%, momentum ${((inp.momentum-1)*100).toFixed(1)}%`);
+  } else {
+    // Middle range — still informative
+    const momPct = ((inp.momentum - 1) * 100).toFixed(1);
+    r.push(`Technical neutral: CAGR ${inp.cagr.toFixed(1)}%, momentum ${momPct}%, drawdown ${inp.maxDrawdown.toFixed(1)}%`);
+  }
+
+  // Fundamental signal — always include when we have data
+  if (signals.fundamental >= 70 && inp.dataQuality !== 'LOW') {
+    r.push(`Quality fundamentals: ROE ${inp.roe?.toFixed(1) ?? 'N/A'}%, ROCE ${inp.roce?.toFixed(1) ?? 'N/A'}%, PE ${inp.pe?.toFixed(1) ?? 'N/A'}x`);
+  } else if (signals.fundamental <= 35 && inp.pe != null) {
+    r.push(`Valuation stretched: PE ${inp.pe.toFixed(1)}x vs fair ${SECTOR_PE_FAIR[inp.sector] ?? 22}x`);
+  } else if (inp.roe != null || inp.pe != null) {
+    const parts: string[] = [];
+    if (inp.pe != null) parts.push(`PE ${inp.pe.toFixed(1)}x`);
+    if (inp.roe != null) parts.push(`ROE ${inp.roe.toFixed(1)}%`);
+    if (inp.promoterHolding != null) parts.push(`Promoter ${inp.promoterHolding.toFixed(0)}%`);
+    if (parts.length > 0) r.push(`Fundamentals: ${parts.join(', ')}`);
+  }
+
+  // Price vs 52W range — very useful for users
+  if (inp.currentPrice != null && inp.weekHigh52 != null && inp.weekLow52 != null) {
+    const range = inp.weekHigh52 - inp.weekLow52;
+    const pos = range > 0 ? ((inp.currentPrice - inp.weekLow52) / range * 100).toFixed(0) : null;
+    if (pos !== null) {
+      const fromHigh = ((inp.weekHigh52 - inp.currentPrice) / inp.weekHigh52 * 100).toFixed(1);
+      r.push(`Price ₹${inp.currentPrice.toLocaleString('en-IN')} — ${pos}% of 52W range, ${fromHigh}% below 52W high`);
+    }
+  }
+
+  // Patterns
   if (patterns.length > 0) r.push(`Chart patterns: ${patterns.join(', ')}`);
-  if (signals.momentum >= 72) r.push(`Momentum accelerating: ${inp.ret30 != null ? `+${inp.ret30.toFixed(1)}% (30d), +${inp.ret90?.toFixed(1)}% (90d)` : `CAGR ${inp.cagr.toFixed(1)}%`}`);
+
+  // Momentum
+  if (signals.momentum >= 72) r.push(`Momentum accelerating: ${inp.ret30 != null ? `+${inp.ret30.toFixed(1)}% (30d), +${inp.ret90?.toFixed(1) ?? '?'}% (90d)` : `CAGR ${inp.cagr.toFixed(1)}%`}`);
+
+  // Macro
   if (signals.macro >= 70) r.push(`${inp.sector} sector in strong rotation (macro score ${signals.macro.toFixed(0)})`);
   else if (signals.macro <= 38) r.push(`${inp.sector} facing macro headwinds`);
+
   if (inp.volumeGrowth >= 1.8) r.push(`Institutional accumulation: vol ${((inp.volumeGrowth-1)*100).toFixed(0)}% above baseline`);
   if (regime === 'VOLATILE') r.push('High volatility regime — reduce position size');
   if (inp.dataSource === 'synthetic') r.push('Note: using simulated data — verify before trading');
-  return r.slice(0, 4);
+  return r.slice(0, 5);
 }
 
 function buildCatalysts(inp: SuperbrainInput, signals: SuperbrainOutput['signals'], patterns: string[]): string[] {

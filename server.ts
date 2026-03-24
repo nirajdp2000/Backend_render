@@ -4518,20 +4518,24 @@ Respond ONLY with this JSON structure (fill every field):
     const profile = universe.find(p => p.symbol === symbol);
     if (!profile) return res.status(404).json({ error: `Symbol ${symbol} not found in universe` });
 
-    // ── Step 1: Fast live price (always fresh, <1s) + fundamentals in parallel ──
-    // fetchYahooQuote: 1d range, just meta — very fast
-    // fetchYahooFundamentals: 5d range, has lastPrice + 52W + PE — medium fast
-    // fetchScreenerFundamentals: HTML scrape — slow, run in background
-    // fetchRealOHLCV: 2yr OHLCV — use cached if available, else skip (too slow for on-demand)
-    const FAST_TIMEOUT = 6000;
+    // ── Step 1: Fetch price + fundamentals + screener in parallel (all awaited) ──
+    // fetchYahooQuote: 1d range, just meta — very fast (~1s)
+    // fetchYahooFundamentals: 5d range, has lastPrice + 52W — medium fast (~2s)
+    // fetchScreenerFundamentals: HTML scrape — slower but MUST be awaited for real PE/ROE/ROCE
+    // All run in parallel with individual timeouts so one slow source doesn't block others
+    const FAST_TIMEOUT  = 5000;   // Yahoo quote / fundamentals
+    const SCRN_TIMEOUT  = 8000;   // Screener.in — allow more time, critical for fundamentals
 
-    const [quoteResult, yahooResult] = await Promise.allSettled([
-      Promise.race([fetchYahooQuote(symbol), new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
-      Promise.race([fetchYahooFundamentals(symbol), new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
+    // Check if screener already cached — if so, no timeout needed
+    const screenerCached = getEnrichedFromCache(symbol)?.screener ?? null;
+
+    const [quoteResult, yahooResult, screenerResult] = await Promise.allSettled([
+      Promise.race([fetchYahooQuote(symbol),          new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
+      Promise.race([fetchYahooFundamentals(symbol),   new Promise<null>(r => setTimeout(() => r(null), FAST_TIMEOUT))]),
+      screenerCached
+        ? Promise.resolve(screenerCached)
+        : Promise.race([fetchScreenerFundamentals(symbol), new Promise<null>(r => setTimeout(() => r(null), SCRN_TIMEOUT))]),
     ]);
-
-    // Kick off screener in background (don't wait)
-    fetchScreenerFundamentals(symbol).catch(() => {});
 
     // Use cached OHLCV if available (don't re-fetch 2yr on every click)
     const cachedOHLCV = realOHLCVCache.get(symbol);
@@ -4542,21 +4546,29 @@ Respond ONLY with this JSON structure (fill every field):
       warmOHLCVBackground([symbol]);
     }
 
-    const quote = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
-    const yahoo = yahooResult.status === 'fulfilled' ? yahooResult.value : null;
+    const quote    = quoteResult.status    === 'fulfilled' ? quoteResult.value    : null;
+    const yahoo    = yahooResult.status    === 'fulfilled' ? yahooResult.value    : null;
+    const screener = screenerResult.status === 'fulfilled' ? screenerResult.value : null;
 
-    // ── Step 2: Resolve best available price (priority: live quote > yahoo > ohlcv cache > ohlcv last close) ──
+    // ── Step 2: Resolve best available price ──
+    // Priority: live quote > yahoo fundamentals > ohlcv cache livePrice
+    // For changePct: prefer yahoo pChange (computed from prevClose) over quote.changePct
+    // because quote.changePct returns 0 when market is closed (regularMarketChangePercent=0)
     const livePrice =
       (quote?.price ?? 0) > 0 ? quote!.price :
       (yahoo?.lastPrice ?? 0) > 0 ? yahoo!.lastPrice :
       (cachedOHLCV?.livePrice ?? 0) > 0 ? cachedOHLCV!.livePrice! :
       null;
 
-    const changePct =
-      quote?.changePct ??
-      yahoo?.pChange ??
-      cachedOHLCV?.changePct ??
-      null;
+    // Use yahoo pChange (computed from prevClose) when quote returns 0 or null
+    const changePct = (() => {
+      const qc = quote?.changePct ?? null;
+      const yc = yahoo?.pChange ?? null;
+      const oc = cachedOHLCV?.changePct ?? null;
+      // If quote changePct is 0 but yahoo has a real value, prefer yahoo
+      if ((qc === null || qc === 0) && yc !== null && yc !== 0) return yc;
+      return qc ?? yc ?? oc ?? null;
+    })();
 
     // Update perSymbolPriceCache with fresh price
     if (livePrice && livePrice > 0) {
@@ -4646,14 +4658,21 @@ Respond ONLY with this JSON structure (fill every field):
     })();
 
     // ── Step 4: Fundamentals ──
+    // Use the awaited screener result directly (not from cache lookup)
+    // Merge with any cached enriched data for news headlines
     const enrichedData = getEnrichedFromCache(symbol);
-    const screener = enrichedData?.screener ?? null;
-    const fundamentalScore = enrichedData ? computeFundamentalScore(enrichedData) : null;
+    // screener is already resolved above from the parallel fetch
+    const fundamentalScore = (yahoo || screener)
+      ? computeFundamentalScore({ symbol, yahoo, screener, newsHeadlines: enrichedData?.newsHeadlines ?? [], dataQuality: 'HIGH', enrichedAt: new Date().toISOString() })
+      : null;
 
     const dataSource: 'real' | 'synthetic' = (resolvedPrice != null || hasRealOHLCV) ? 'real' : 'synthetic';
     const dataQuality: 'HIGH' | 'MEDIUM' | 'LOW' =
       (yahoo && screener) ? 'HIGH' :
       (yahoo || hasRealOHLCV) ? 'MEDIUM' : 'LOW';
+
+    // Resolve PE: screener is more reliable than Yahoo v8 chart meta
+    const resolvedPE = screener?.pe ?? yahoo?.pe ?? null;
 
     // ── Step 5: Run Superbrain ──
     const sbInput: SuperbrainInput = {
@@ -4678,7 +4697,7 @@ Respond ONLY with this JSON structure (fill every field):
             return ((resolvedPrice - vwap) / Math.max(vwap, 1)) * 100;
           })()
         : undefined,
-      pe: yahoo?.pe ?? screener?.pe ?? null,
+      pe: resolvedPE,
       roe: screener?.roe ?? null,
       roce: screener?.roce ?? null,
       debtToEquity: screener?.debtToEquity ?? null,

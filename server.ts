@@ -4093,9 +4093,9 @@ Respond ONLY with this JSON structure (fill every field):
     }
 
     // ── Pass 1: Ultra-fast pre-sort using deterministic hash — handles 5000+ stocks ──
-    // Cap to top 500 by marketCap to keep computation fast on Render free tier
-    const scanUniverse = fullUniverse.length > 500
-      ? fullUniverse.slice().sort((a, b) => b.marketCap - a.marketCap).slice(0, 500)
+    // Cap to top 200 by marketCap to keep computation fast on Render free tier
+    const scanUniverse = fullUniverse.length > 200
+      ? fullUniverse.slice().sort((a, b) => b.marketCap - a.marketCap).slice(0, 200)
       : fullUniverse;
     const preScored = scanUniverse.map(p => {
       const seed = symbolSeed(p.symbol);

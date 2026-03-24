@@ -6417,6 +6417,48 @@ async function startServer() {
     // Resolve Superbrain outcomes daily (checks if past BUY/SELL calls were correct)
     resolveOutcomes().catch(() => {});
     setInterval(() => resolveOutcomes().catch(() => {}), 24 * 60 * 60 * 1000);
+
+    // ── Startup price warm: fetch live prices for top 100 symbols immediately ──
+    // Runs 30s after server starts to let universe load settle first.
+    setTimeout(() => {
+      const adminSecret = process.env.ADMIN_SECRET || 'stockpulse-eod';
+      console.log('[StartupWarm] Triggering EOD refresh for top 100 symbols...');
+      fetch(`http://localhost:${PORT}/api/admin/refresh-eod`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-secret': adminSecret },
+        body: JSON.stringify({ secret: adminSecret }),
+      }).then(r => r.json()).then((d: any) => {
+        console.log(`[StartupWarm] EOD refresh queued: ${d.queued ?? 0} symbols`);
+      }).catch(e => console.warn('[StartupWarm] EOD refresh failed:', e.message));
+    }, 30_000);
+
+    // ── Daily EOD scheduler: auto-refresh at 4:30 PM IST on trading days ──
+    // Checks every minute; fires once per day when IST time is 16:30.
+    let lastEodDate = '';
+    setInterval(() => {
+      const now = new Date();
+      // IST = UTC+5:30
+      const istOffset = 5.5 * 60 * 60_000;
+      const ist = new Date(now.getTime() + istOffset);
+      const hh = ist.getUTCHours();
+      const mm = ist.getUTCMinutes();
+      const day = ist.getUTCDay(); // 0=Sun, 6=Sat
+      const dateKey = ist.toISOString().slice(0, 10);
+
+      // 4:30 PM IST, Mon–Fri only, once per day
+      if (hh === 16 && mm === 30 && day >= 1 && day <= 5 && dateKey !== lastEodDate) {
+        lastEodDate = dateKey;
+        const adminSecret = process.env.ADMIN_SECRET || 'stockpulse-eod';
+        console.log(`[EODScheduler] Triggering daily EOD refresh at 4:30 PM IST (${dateKey})`);
+        fetch(`http://localhost:${PORT}/api/admin/refresh-eod`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-admin-secret': adminSecret },
+          body: JSON.stringify({ secret: adminSecret }),
+        }).then(r => r.json()).then((d: any) => {
+          console.log(`[EODScheduler] EOD refresh queued: ${d.queued ?? 0} symbols`);
+        }).catch(e => console.warn('[EODScheduler] EOD refresh failed:', e.message));
+      }
+    }, 60_000); // check every minute
   });
 
   // Graceful shutdown handler

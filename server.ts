@@ -6689,6 +6689,41 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     }
   });
 
+  // Force-save current prediction cache to DB (admin endpoint for manual refresh)
+  app.post("/api/predictions/force-save", async (req, res) => {
+    try {
+      if (!predCache) {
+        return res.status(400).json({ error: 'No prediction cache available — run /api/predictions/run first' });
+      }
+      const today = new Date().toISOString().split('T')[0];
+      const { bullish, bearish } = predCache.data;
+      const allTop = [...bullish, ...bearish];
+      await PredictionStorageService.saveAllPredictions(today, allTop.map((r: any) => ({
+        stock_symbol: r.stock,
+        prediction_date: today,
+        target_date: today,
+        prediction: r.prediction,
+        confidence: r.confidence,
+        predicted_price: r.predicted_price,
+        current_price: r.current_price,
+        sector: r.sector,
+        signals: {
+          RSI: r.signals.RSI, MACD: r.signals.MACD,
+          Volume: r.signals.Volume, Trend: r.signals.Trend,
+          Sentiment: r.signals.Sentiment, Bollinger: r.signals.Bollinger,
+          Stochastic: r.signals.Stochastic, Acceleration: r.signals.Acceleration,
+          ATR: r.indicators?.atr ?? 0,
+          current_price: r.current_price,
+          sector: r.sector,
+        },
+        explanation: r.explanation,
+      })));
+      res.json({ success: true, saved: allTop.length, date: today });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ─── Rankings History Engine ──────────────────────────────────────────────
   // Stores daily top-50 snapshot on trading days for historical tracking.
   // Schema (Supabase table: rankings_history):

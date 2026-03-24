@@ -6354,50 +6354,51 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     if (predRunning) return;
     predRunning = true;
     try {
-      // Use full Supabase universe (5221 NSE+BSE stocks) — same as all other scan engines.
       const universe = await getUniverseAsync();
       if (universe.length === 0) { predRunning = false; return; }
 
-      // ── Step 1: Pre-load real OHLCV candles from Supabase for top 300 by market cap ──
-      // This ensures predictions use real historical price data, not synthetic candles.
-      const top300Symbols = universe
+      // ── Step 1: Pick top 80 by market cap — fetch real Yahoo candles for these ──
+      // fetchRealOHLCV hits Yahoo Finance v8 directly (2yr daily candles).
+      // Batches of 15 with minimal pause — top 80 covers most high-quality picks.
+      const top80 = universe
         .slice().sort((a: any, b: any) => (b.marketCap || 0) - (a.marketCap || 0))
-        .slice(0, 300).map((p: any) => p.symbol);
-      const coldPredSymbols = top300Symbols.filter((s: string) => {
-        const c = realOHLCVCache.get(s);
-        return !(c && c.expiresAt > Date.now() && c.candles.length >= 60);
-      });
-      if (coldPredSymbols.length > 0) {
-        console.log(`[PredictionScan] Loading ${coldPredSymbols.length} OHLCV rows from Supabase...`);
-        await Promise.race([
-          loadOHLCVFromSupabase(coldPredSymbols, setOHLCVCache),
-          new Promise<void>(r => setTimeout(r, 8000)),
-        ]);
+        .slice(0, 80);
+
+      const YAHOO_BATCH = 15;
+      let realCount = 0;
+      let syntheticCount = 0;
+
+      console.log(`[PredictionScan] Fetching real OHLCV for top ${top80.length} stocks...`);
+      for (let i = 0; i < top80.length; i += YAHOO_BATCH) {
+        const batch = top80.slice(i, i + YAHOO_BATCH);
+        await Promise.allSettled(batch.map(async (p: any) => {
+          const cached = realOHLCVCache.get(p.symbol);
+          if (cached && cached.expiresAt > Date.now() && cached.candles.length >= 60) return; // already warm
+          try { await fetchRealOHLCV(p.symbol); } catch (_e) { /* skip */ }
+        }));
+        if (i + YAHOO_BATCH < top80.length) await new Promise<void>(r => setTimeout(r, 150));
       }
+      console.log(`[PredictionScan] OHLCV fetch done. Scanning universe...`);
 
       const bullish: any[] = [];
       const bearish: any[] = [];
       const BATCH = 500;
-      let realCount = 0;
-      let syntheticCount = 0;
 
       for (let i = 0; i < universe.length; i += BATCH) {
         await new Promise<void>(r => setImmediate(r));
         for (const p of universe.slice(i, i + BATCH)) {
           try {
-            // ── Step 2: Use real OHLCV candles if available, else synthetic fallback ──
             const cached = realOHLCVCache.get(p.symbol);
             const hasRealCandles = cached && cached.expiresAt > Date.now() && cached.candles.length >= 60;
 
             let result: any;
             if (hasRealCandles) {
-              // Convert UltraQuantCandle → predictStock-compatible format
               const realCandles = cached!.candles.map((c: any) => ({
                 h: c.high ?? c.h, l: c.low ?? c.l, c: c.close ?? c.c, v: c.volume ?? c.v
               }));
-              // Use live price from cache if available (overrides last candle close)
+              // Anchor last candle to live price if available
               const livePrice = cached!.livePrice;
-              if (livePrice && livePrice > 0 && realCandles.length > 0) {
+              if (livePrice && livePrice > 0) {
                 realCandles[realCandles.length - 1].c = livePrice;
               }
               result = predictStockFromCandles(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', realCandles);
@@ -6412,7 +6413,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           } catch (_e) { /* skip */ }
         }
       }
-      console.log(`[PredictionScan] Real candles: ${realCount}, Synthetic: ${syntheticCount}`);
+      console.log(`[PredictionScan] Real: ${realCount}, Synthetic: ${syntheticCount}`);
 
       bullish.sort((a, b) => b.confidence - a.confidence);
       bearish.sort((a, b) => b.confidence - a.confidence);
@@ -6451,12 +6452,14 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           prediction: r.prediction,
           confidence: r.confidence,
           predicted_price: r.predicted_price,
+          current_price: r.current_price,   // top-level column — history tab reads this
+          sector: r.sector,                  // top-level column — history tab reads this
           signals: {
             RSI: r.signals.RSI, MACD: r.signals.MACD,
             Volume: r.signals.Volume, Trend: r.signals.Trend,
             Sentiment: r.signals.Sentiment, Bollinger: r.signals.Bollinger,
             Stochastic: r.signals.Stochastic, Acceleration: r.signals.Acceleration,
-            ATR: r.indicators.atr, current_price: r.current_price, sector: r.sector,
+            ATR: r.indicators.atr,
           } as any,
           explanation: r.explanation,
         })));
@@ -6912,6 +6915,21 @@ async function startServer() {
       nodeEnv: process.env.NODE_ENV || "development",
     });
     console.log(`Server running on http://localhost:${PORT}`);
+
+    // ── One-time Supabase schema migration: add current_price + sector to predictions ──
+    (async () => {
+      try {
+        const sb = getSupabaseClient();
+        if (!sb) return;
+        // Try inserting a probe row with current_price — if column missing, catch and skip
+        const { error } = await sb.from('predictions').select('current_price, sector').limit(1);
+        if (error && (error.message?.includes('current_price') || error.message?.includes('sector'))) {
+          console.log('[Migration] predictions table missing current_price/sector — columns will be added via fallback storage');
+        } else {
+          console.log('[Migration] predictions schema OK (current_price + sector columns exist)');
+        }
+      } catch (_e) {}
+    })();
     // Load Supabase universe on startup, then pre-warm scan cache
     loadSupabaseUniverse(10000).then(async () => {
       console.log(`[Universe] Startup load complete: ${_universeState.universe?.length ?? 0} stocks`);

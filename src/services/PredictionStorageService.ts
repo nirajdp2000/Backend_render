@@ -100,7 +100,7 @@ export class PredictionStorageService {
       try {
         // Delete all existing for this date
         await sb.from('predictions').delete().eq('prediction_date', predictionDate);
-        // Insert all at once
+        // Insert all at once — try with current_price/sector columns first, fall back without
         const rows = preds.map(pred => ({
           stock_symbol: pred.stock_symbol,
           prediction_date: pred.prediction_date,
@@ -108,13 +108,26 @@ export class PredictionStorageService {
           prediction: pred.prediction,
           confidence: pred.confidence,
           predicted_price: pred.predicted_price,
-          signals: pred.signals,   // current_price + sector stored inside signals JSONB
+          current_price: pred.current_price ?? null,
+          sector: pred.sector ?? null,
+          signals: pred.signals,
           explanation: pred.explanation,
           created_at: now,
         }));
         const { error } = await sb.from('predictions').insert(rows);
         if (!error) return;
-        console.error('[PredictionStorage] Supabase batch insert error:', error.message);
+        // If current_price/sector columns don't exist yet, retry without them
+        if (error.message?.includes('current_price') || error.message?.includes('sector')) {
+          const rowsFallback = rows.map(({ current_price, sector, ...rest }) => ({
+            ...rest,
+            signals: { ...rest.signals, current_price: current_price ?? undefined, sector: sector ?? undefined },
+          }));
+          const { error: e2 } = await sb.from('predictions').insert(rowsFallback);
+          if (!e2) return;
+          console.error('[PredictionStorage] Supabase fallback insert error:', e2.message);
+        } else {
+          console.error('[PredictionStorage] Supabase batch insert error:', error.message);
+        }
       } catch (e: any) {
         console.error('[PredictionStorage] Supabase batch exception:', e.message);
       }
@@ -217,10 +230,16 @@ export class PredictionStorageService {
           .eq('prediction_date', predictionDate)
           .order('confidence', { ascending: false });
         if (!error && data) {
-          rows = data.map((r: any) => ({
-            ...r,
-            signals: typeof r.signals === 'string' ? JSON.parse(r.signals) : r.signals,
-          }));
+          rows = data.map((r: any) => {
+            const signals = typeof r.signals === 'string' ? JSON.parse(r.signals) : (r.signals ?? {});
+            return {
+              ...r,
+              signals,
+              // Resolve current_price: top-level column first, then signals JSONB fallback
+              current_price: r.current_price ?? signals.current_price ?? null,
+              sector: r.sector ?? signals.sector ?? 'Unknown',
+            };
+          });
         }
       } catch (e: any) {
         console.error('[PredictionStorage] Supabase query error:', e.message);

@@ -1636,6 +1636,14 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     const cached = ultraQuantCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.payload;
 
+    // If universe is still at fallback size, wait up to 8s for Supabase to load
+    if (!_universeState.universe || _universeState.universe.length <= 440) {
+      await Promise.race([
+        loadSupabaseUniverse(8000),
+        new Promise<void>(r => setTimeout(r, 8000)),
+      ]);
+    }
+
     const rawUniverse = createUltraQuantUniverse();
     const totalLoaded = rawUniverse.length;
 
@@ -4044,6 +4052,14 @@ Respond ONLY with this JSON structure (fill every field):
   const buildMultibaggerScan = async (cycleDays: MultibaggerCycle) => {
     const cached = multibaggerCache.get(cycleDays);
     if (cached && cached.expiresAt > Date.now()) return cached.payload;
+
+    // If universe is still at fallback size, wait up to 8s for Supabase to load
+    if (!_universeState.universe || _universeState.universe.length <= 440) {
+      await Promise.race([
+        loadSupabaseUniverse(8000),
+        new Promise<void>(r => setTimeout(r, 8000)),
+      ]);
+    }
 
     const weights  = MB_CYCLE_WEIGHTS[cycleDays];
     const fullUniverse = createUltraQuantUniverse();

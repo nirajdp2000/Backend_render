@@ -6269,9 +6269,17 @@ async function startServer() {
       nodeEnv: process.env.NODE_ENV || "development",
     });
     console.log(`Server running on http://localhost:${PORT}`);
-    // Load Supabase universe on startup (Render persistent server — not serverless)
-    loadSupabaseUniverse(10000).then(() => {
+    // Load Supabase universe on startup, then pre-warm scan cache
+    loadSupabaseUniverse(10000).then(async () => {
       console.log(`[Universe] Startup load complete: ${_universeState.universe?.length ?? 0} stocks`);
+      // Pre-warm multibagger scan cache so first user request is instant
+      try {
+        const warmRes = await fetch(`http://localhost:${PORT}/api/multibagger/scan?cycle=30`);
+        const warmData = await warmRes.json() as any;
+        console.log(`[Prewarm] Multibagger scan cached: ${warmData.scannedUniverse} stocks`);
+      } catch (e: any) {
+        console.warn('[Prewarm] Scan pre-warm failed:', e.message);
+      }
     }).catch(err => console.warn('[Universe] Startup load failed:', err.message));
     // Kick off full market universe load in background (doesn't block startup)
     initUniverse().catch(err =>

@@ -6250,6 +6250,101 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     };
   }
 
+  // ── predictStockFromCandles — uses REAL OHLCV candles (not synthetic) ──
+  // Same 8-signal model as predictStock but takes pre-fetched real candle data.
+  function predictStockFromCandles(
+    symbol: string, sector: string, exchange: string,
+    candles: Array<{h:number;l:number;c:number;v:number}>
+  ) {
+    if (candles.length < 30) return null;
+    const closes = candles.map(c => c.c);
+    const vols   = candles.map(c => c.v);
+
+    const rsi          = predRSI(closes);
+    const macdHist     = predMACD(closes);
+    const ema9         = predEMA(closes, 9);
+    const ema21        = predEMA(closes, 21);
+    const ema50        = predEMA(closes, 50);
+    const volRatio     = predVolRatio(vols);
+    const atr          = predATR(candles, 14);
+    const bollinger    = predBollinger(closes);
+    const sentiment    = predSentiment(candles);
+    const stochastic   = predStochastic(candles);
+    const acceleration = predAcceleration(closes);
+    const price        = closes[closes.length - 1];
+
+    const rsiScore    = Math.max(-1, Math.min(1, (rsi - 50) / 28));
+    const macdScore   = price > 0 ? Math.max(-1, Math.min(1, macdHist / (price * 0.004))) : Math.sign(macdHist);
+    const volAmp      = Math.min(1, Math.max(0, (volRatio - 0.8) / 1.5));
+    const dirSignal   = rsiScore + macdScore + stochastic;
+    const volScore    = dirSignal !== 0 ? volAmp * Math.sign(dirSignal) : 0;
+    const shortTrend  = ema21 > 0 ? Math.max(-1, Math.min(1, (ema9  - ema21) / (ema21 * 0.015))) : 0;
+    const medTrend    = ema50 > 0 ? Math.max(-1, Math.min(1, (ema21 - ema50) / (ema50 * 0.025))) : 0;
+    const trendScore  = 0.6 * shortTrend + 0.4 * medTrend;
+
+    const score = 0.20 * rsiScore + 0.18 * macdScore + 0.15 * trendScore
+                + 0.12 * stochastic + 0.12 * bollinger + 0.10 * sentiment
+                + 0.08 * volScore   + 0.05 * acceleration;
+
+    if (Math.abs(score) < 0.10) return null;
+
+    const prediction = score > 0 ? 'Bullish' : 'Bearish';
+    const dir = score > 0 ? 1 : -1;
+
+    const allSignals = [rsiScore, macdScore, trendScore, stochastic, bollinger, sentiment, volScore, acceleration];
+    const agreeing   = allSignals.filter(s => s * dir > 0.05).length;
+    const agreement  = 0.30 + 0.70 * (agreeing / allSignals.length);
+    const volFactor  = price > 0 ? Math.min(0.35, (atr / price) * 7) : 0;
+    const confidence = Math.max(55, Math.min(95, Math.round(Math.abs(score) * 180 * (1 - volFactor) * agreement)));
+
+    if (confidence < 58) return null;
+    if (agreeing < 4) return null;
+
+    const parts: string[] = [];
+    if (rsi > 65)       parts.push(`RSI ${rsi.toFixed(0)} strong`);
+    else if (rsi < 35)  parts.push(`RSI ${rsi.toFixed(0)} oversold`);
+    else                parts.push(`RSI ${rsi.toFixed(0)}`);
+    parts.push(macdHist > 0 ? 'MACD bullish' : 'MACD bearish');
+    if (shortTrend > 0.3 && medTrend > 0)  parts.push('EMA aligned up');
+    else if (shortTrend < -0.3 && medTrend < 0) parts.push('EMA aligned down');
+    if (volRatio > 1.5) parts.push(`${volRatio.toFixed(1)}x vol`);
+    if (bollinger > 0.5)  parts.push('BB breakout up');
+    else if (bollinger < -0.5) parts.push('BB oversold');
+    if (sentiment > 0.4)  parts.push('strong momentum');
+    else if (sentiment < -0.4) parts.push('weak momentum');
+    if (acceleration > 0.3) parts.push('accelerating');
+    const explanation = `${prediction} — ${parts.slice(0, 4).join(', ')}`;
+
+    const atrPct = price > 0 ? atr / price : 0.01;
+    const targetMult = 0.4 + (confidence - 55) / 100;
+    const predictedPrice = +(price * (1 + atrPct * targetMult * dir)).toFixed(2);
+
+    return {
+      stock: symbol, sector, exchange,
+      prediction, confidence,
+      dataSource: 'real',
+      signals: {
+        RSI: +rsiScore.toFixed(3), MACD: +macdScore.toFixed(3),
+        Volume: +volScore.toFixed(3), Trend: +trendScore.toFixed(3),
+        Sentiment: +sentiment.toFixed(3), Bollinger: +bollinger.toFixed(3),
+        Stochastic: +stochastic.toFixed(3), Acceleration: +acceleration.toFixed(3),
+      },
+      explanation,
+      predicted_price: predictedPrice,
+      current_price: +price.toFixed(2),
+      raw_score: +score.toFixed(4),
+      indicators: {
+        rsi: +rsi.toFixed(1), atr: +atr.toFixed(2),
+        volumeRatio: +volRatio.toFixed(2),
+        ema20: +ema9.toFixed(2), ema50: +ema50.toFixed(2),
+        bollinger: +bollinger.toFixed(3),
+        sentiment: +sentiment.toFixed(3),
+        stochastic: +stochastic.toFixed(3),
+        acceleration: +acceleration.toFixed(3),
+      },
+    };
+  }
+
   // ── Background scan state ──
   let predCache: { data: any; ts: number } | null = null;
   let predRunning = false;
@@ -6263,21 +6358,61 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       const universe = await getUniverseAsync();
       if (universe.length === 0) { predRunning = false; return; }
 
+      // ── Step 1: Pre-load real OHLCV candles from Supabase for top 300 by market cap ──
+      // This ensures predictions use real historical price data, not synthetic candles.
+      const top300Symbols = universe
+        .slice().sort((a: any, b: any) => (b.marketCap || 0) - (a.marketCap || 0))
+        .slice(0, 300).map((p: any) => p.symbol);
+      const coldPredSymbols = top300Symbols.filter((s: string) => {
+        const c = realOHLCVCache.get(s);
+        return !(c && c.expiresAt > Date.now() && c.candles.length >= 60);
+      });
+      if (coldPredSymbols.length > 0) {
+        console.log(`[PredictionScan] Loading ${coldPredSymbols.length} OHLCV rows from Supabase...`);
+        await Promise.race([
+          loadOHLCVFromSupabase(coldPredSymbols, setOHLCVCache),
+          new Promise<void>(r => setTimeout(r, 8000)),
+        ]);
+      }
+
       const bullish: any[] = [];
       const bearish: any[] = [];
       const BATCH = 500;
+      let realCount = 0;
+      let syntheticCount = 0;
 
       for (let i = 0; i < universe.length; i += BATCH) {
         await new Promise<void>(r => setImmediate(r));
         for (const p of universe.slice(i, i + BATCH)) {
           try {
-            const result = predictStock(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', p.averageVolume || 0);
+            // ── Step 2: Use real OHLCV candles if available, else synthetic fallback ──
+            const cached = realOHLCVCache.get(p.symbol);
+            const hasRealCandles = cached && cached.expiresAt > Date.now() && cached.candles.length >= 60;
+
+            let result: any;
+            if (hasRealCandles) {
+              // Convert UltraQuantCandle → predictStock-compatible format
+              const realCandles = cached!.candles.map((c: any) => ({
+                h: c.high ?? c.h, l: c.low ?? c.l, c: c.close ?? c.c, v: c.volume ?? c.v
+              }));
+              // Use live price from cache if available (overrides last candle close)
+              const livePrice = cached!.livePrice;
+              if (livePrice && livePrice > 0 && realCandles.length > 0) {
+                realCandles[realCandles.length - 1].c = livePrice;
+              }
+              result = predictStockFromCandles(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', realCandles);
+              if (result) realCount++;
+            } else {
+              result = predictStock(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', p.averageVolume || 0);
+              if (result) { result.dataSource = 'synthetic'; syntheticCount++; }
+            }
             if (!result) continue;
             if (result.prediction === 'Bullish') bullish.push(result);
             else bearish.push(result);
           } catch (_e) { /* skip */ }
         }
       }
+      console.log(`[PredictionScan] Real candles: ${realCount}, Synthetic: ${syntheticCount}`);
 
       bullish.sort((a, b) => b.confidence - a.confidence);
       bearish.sort((a, b) => b.confidence - a.confidence);
@@ -6294,10 +6429,12 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           generatedAt: new Date().toISOString(),
           marketDay: isMarketDay(),
           marketOpen: isMarketHours(),
+          realDataCount: realCount,
+          syntheticDataCount: syntheticCount,
         },
         ts: Date.now(),
       };
-      console.log(`[PredictionScan] Done — ${universe.length} stocks, ${bullish.length} bullish, ${bearish.length} bearish`);
+      console.log(`[PredictionScan] Done — ${universe.length} stocks, ${bullish.length} bullish, ${bearish.length} bearish, real=${realCount} synthetic=${syntheticCount}`);
 
       // Persist predictions only on actual trading days — prevents weekend/holiday
       // synthetic data from polluting the history tab with fake "changed stocks"

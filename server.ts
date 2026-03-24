@@ -2094,9 +2094,42 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
 
   // Full universe endpoint — waits for real universe before responding
   app.get("/api/stocks/universe", async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      const supabase = getSupabaseClient();
+      if (supabase) {
+        // Query Supabase directly — bypasses StockUniverseService to always get full 5000+ list
+        const PAGE_SIZE = 1000;
+        let allRows: any[] = [];
+        let from = 0;
+        let done = false;
+        while (!done) {
+          const { data, error } = await supabase
+            .from('stock_universe')
+            .select('symbol,name,exchange,sector,instrument_key')
+            .range(from, from + PAGE_SIZE - 1);
+          if (error || !data || data.length === 0) { done = true; break; }
+          allRows = allRows.concat(data);
+          from += PAGE_SIZE;
+          if (data.length < PAGE_SIZE) done = true;
+        }
+        if (allRows.length > 440) {
+          console.log(`[Universe] Serving ${allRows.length} stocks from Supabase`);
+          return res.json(allRows.map(row => ({
+            symbol:   row.symbol,
+            name:     row.name || row.symbol,
+            key:      row.instrument_key || `NSE_EQ|${row.symbol}`,
+            exchange: row.exchange || 'NSE',
+            sector:   row.sector || 'Unknown',
+          })));
+        }
+      }
+    } catch (e: any) {
+      console.warn('[Universe] Direct Supabase query failed:', e.message);
+    }
+    // Fallback to StockUniverseService
     const universe = await getUniverseAsync();
-    console.log(`[Universe] Serving ${universe.length} stocks`);
-  res.setHeader('Cache-Control', 'no-store'); // always fresh — universe updates daily
+    console.log(`[Universe] Serving ${universe.length} stocks (fallback)`);
     res.json(universe.map(s => ({
       symbol:   s.symbol,
       name:     s.name || s.symbol,
@@ -2109,8 +2142,10 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
   // Debug endpoint — universe load status
   app.get("/api/debug/universe", async (req, res) => {
     const universe = await getUniverseAsync();
+    const supabaseCount = _universeState.universe?.length ?? 0;
     res.json({
       count: universe.length,
+      supabaseDirectCount: supabaseCount,
       source: universe.length > 440 ? 'supabase' : 'fallback',
       sample: universe.slice(0, 3).map(s => ({ symbol: s.symbol, name: s.name })),
     });

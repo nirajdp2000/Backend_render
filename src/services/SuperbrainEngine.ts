@@ -475,20 +475,11 @@ function kellyPosition(winProb: number, riskScore: number, superScore: number): 
 
 // ── ATR-based Price Targets ───────────────────────────────────────────────────
 function computeTargets(inp: SuperbrainInput, superScore: number, riskScore: number) {
-  // Use real price if available, otherwise synthesise a plausible price from market cap
-  let price = inp.currentPrice ?? null;
-  let isSyntheticPrice = false;
+  // Only compute targets when we have a real price — never synthesise from market cap
+  const price = inp.currentPrice ?? null;
 
   if (!price || price <= 0) {
-    // Estimate price from market cap (Cr) and a typical share count proxy
-    // Indian mid-cap: ~50Cr shares outstanding on average; large-cap ~200Cr
-    if (inp.marketCap && inp.marketCap > 0) {
-      const sharesEst = inp.marketCap >= 50000 ? 200e6 : inp.marketCap >= 5000 ? 50e6 : 10e6;
-      price = Number(((inp.marketCap * 1e7) / sharesEst).toFixed(2));
-      isSyntheticPrice = true;
-    } else {
-      return { targetPrice: null, stopLoss: null, upside: null };
-    }
+    return { targetPrice: null, stopLoss: null, upside: null };
   }
 
   // ATR proxy from volatility (daily vol * sqrt(14) * price)
@@ -505,7 +496,7 @@ function computeTargets(inp: SuperbrainInput, superScore: number, riskScore: num
 
   // Blend with CAGR-based target for real data
   let finalTarget = targetPrice;
-  if (!isSyntheticPrice && inp.dataSource === 'real' && inp.cagr >= 5 && inp.cagr <= 80) {
+  if (inp.dataSource === 'real' && inp.cagr >= 5 && inp.cagr <= 80) {
     const holdMonths = superScore >= 75 ? 12 : superScore >= 60 ? 9 : 6;
     const cagrTarget = price * (1 + (inp.cagr / 100) * holdMonths / 12);
     finalTarget = Number(lerp(targetPrice, cagrTarget, 0.35).toFixed(2));

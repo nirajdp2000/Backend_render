@@ -1677,10 +1677,10 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     const top200Symbols = rawUniverse
       .slice().sort((a, b) => b.marketCap - a.marketCap).slice(0, 200).map(p => p.symbol);
     const coldSymbols = top200Symbols.filter(s => !(realOHLCVCache.get(s)?.expiresAt ?? 0 > Date.now()));
-    if (coldSymbols.length > 10) {
+    if (coldSymbols.length > 0 && coldSymbols.length < 50) {
       await Promise.race([
         loadOHLCVFromSupabase(coldSymbols, setOHLCVCache),
-        new Promise<void>(r => setTimeout(r, 2000)),
+        new Promise<void>(r => setTimeout(r, 500)),
       ]);
     }
 
@@ -4080,15 +4080,15 @@ Respond ONLY with this JSON structure (fill every field):
 
     const weights  = MB_CYCLE_WEIGHTS[cycleDays];
     const fullUniverse = createUltraQuantUniverse();
-    // ── Pass 0: Pre-load OHLCV from Supabase on cold start (one query, ~50ms) ──
-    // Only query top 200 by marketCap — these are the symbols refreshed by EOD batch.
+    // ── Pass 0: Pre-load OHLCV from Supabase — skip on cold start to avoid timeout ──
     const mbTop200Symbols = fullUniverse
       .slice().sort((a, b) => b.marketCap - a.marketCap).slice(0, 200).map(p => p.symbol);
     const mbColdSymbols = mbTop200Symbols.filter(s => !(realOHLCVCache.get(s)?.expiresAt ?? 0 > Date.now()));
-    if (mbColdSymbols.length > 10) {
+    if (mbColdSymbols.length > 0 && mbColdSymbols.length < 50) {
+      // Only load if mostly warm — avoids blocking on full cold start
       await Promise.race([
         loadOHLCVFromSupabase(mbColdSymbols, setOHLCVCache),
-        new Promise<void>(r => setTimeout(r, 2000)),
+        new Promise<void>(r => setTimeout(r, 500)),
       ]);
     }
 

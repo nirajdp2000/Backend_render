@@ -164,7 +164,7 @@ export class UpstoxTokenManager {
   private async refreshAccessToken(refreshToken: string, redirectUriOverride?: string): Promise<void> {
     const clientId = process.env.UPSTOX_CLIENT_ID || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
     const clientSecret = process.env.UPSTOX_CLIENT_SECRET || 'tqfd41uqib';
-    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://your-render-url.onrender.com/api/upstox/callback';
+    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
     if (!clientId || !clientSecret || !redirectUri) throw new Error('Upstox credentials not configured');
 
     const params = new URLSearchParams({
@@ -231,7 +231,7 @@ export class UpstoxTokenManager {
   async exchangeAuthorizationCode(code: string, redirectUriOverride?: string): Promise<void> {
     const clientId = process.env.UPSTOX_CLIENT_ID || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
     const clientSecret = process.env.UPSTOX_CLIENT_SECRET || 'tqfd41uqib';
-    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://your-render-url.onrender.com/api/upstox/callback';
+    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
     if (!clientId || !clientSecret || !redirectUri) throw new Error('Upstox credentials not configured');
 
     const params = new URLSearchParams({

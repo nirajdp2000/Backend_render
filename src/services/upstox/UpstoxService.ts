@@ -47,7 +47,7 @@ export class UpstoxService {
    */
   getAuthorizationUrl(redirectUriOverride?: string): string {
     const clientId = process.env.UPSTOX_CLIENT_ID || '37381aec-8f2d-47da-a89b-ab9476dd15d7';
-    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://your-render-url.onrender.com/api/upstox/callback';
+    const redirectUri = redirectUriOverride || process.env.UPSTOX_REDIRECT_URI || 'https://backend-render-qyt7.onrender.com/api/upstox/callback';
 
     if (!clientId || !redirectUri) {
       throw new Error('Upstox credentials not configured in .env');

@@ -702,32 +702,55 @@ const getUniverseSync = (): UltraQuantProfile[] => {
  * Load Supabase universe with a timeout. Updates _universeState.universe in place.
  * Safe to call from startServerlessApp — uses only _universeState (no closure vars).
  */
-const loadSupabaseUniverse = async (timeoutMs = 6000): Promise<void> => {
+const loadSupabaseUniverse = async (timeoutMs = 10000): Promise<void> => {
   if (_universeState.loading) return;
+  // Already have full universe — skip
+  if (_universeState.universe && _universeState.universe.length > 440) return;
   _universeState.loading = true;
   try {
-    const loaded = getUniverseAsync().then(stocks => {
-      if (stocks.length > 0) {
+    const supabase = getSupabaseClient();
+    if (!supabase) { console.warn('[Universe] No Supabase client'); return; }
+
+    console.log('[Universe] Loading from Supabase stock_universe table...');
+    const PAGE_SIZE = 1000;
+    let allRows: any[] = [];
+    let from = 0;
+    let done = false;
+
+    const loadAll = async () => {
+      while (!done) {
+        const { data, error } = await supabase
+          .from('stock_universe')
+          .select('symbol,name,exchange,sector,industry,market_cap,avg_volume,instrument_key')
+          .range(from, from + PAGE_SIZE - 1);
+        if (error || !data || data.length === 0) { done = true; break; }
+        allRows = allRows.concat(data);
+        from += PAGE_SIZE;
+        if (data.length < PAGE_SIZE) done = true;
+      }
+      if (allRows.length > 0) {
         const curatedMap = new Map(NSE_STOCK_UNIVERSE.map(s => [s.symbol, s]));
-        _universeState.universe = stocks.map(s => {
-          const c = curatedMap.get(s.symbol);
+        _universeState.universe = allRows.map(row => {
+          const c = curatedMap.get(row.symbol);
           return {
-            symbol:        s.symbol,
-            sector:        c?.sector  || s.sector  || 'Unknown',
-            industry:      c?.industry || s.industry || 'Unknown',
-            marketCap:     c?.marketCap || (s.marketCap > 0 ? s.marketCap : 1000),
-            averageVolume: c?.averageVolume || (s.averageVolume > 0 ? s.averageVolume : 100000),
+            symbol:        row.symbol,
+            sector:        c?.sector  || row.sector  || 'Unknown',
+            industry:      c?.industry || row.industry || 'Unknown',
+            marketCap:     c?.marketCap || (Number(row.market_cap) > 0 ? Number(row.market_cap) : 1000),
+            averageVolume: c?.averageVolume || (Number(row.avg_volume) > 0 ? Number(row.avg_volume) : 100000),
           };
         });
-        // Invalidate scan caches so next request uses full universe
         ultraQuantCache.clear();
         multibaggerCache.clear();
         _cachedUniverse = null;
         console.log(`[Universe] Loaded ${_universeState.universe.length} stocks from Supabase`);
       }
-    });
-    await Promise.race([loaded, new Promise<void>(r => setTimeout(r, timeoutMs))]);
-  } catch (_e) { /* keep embedded */ } finally {
+    };
+
+    await Promise.race([loadAll(), new Promise<void>(r => setTimeout(r, timeoutMs))]);
+  } catch (e: any) {
+    console.warn('[Universe] Supabase load failed:', e.message);
+  } finally {
     _universeState.loading = false;
   }
 };

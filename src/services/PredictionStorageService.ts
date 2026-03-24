@@ -243,10 +243,21 @@ export class PredictionStorageService {
             return {
               ...r,
               signals,
-              // Resolve current_price: top-level column first, then signals JSONB fallback
               current_price: r.current_price ?? signals.current_price ?? null,
               sector: r.sector ?? signals.sector ?? 'Unknown',
+              // Use stored dataSource from signals JSONB; fall back to heuristic for old rows
+              dataSource: signals.dataSource ?? (
+                signals.current_price != null && signals.current_price > 0
+                && (r.explanation?.includes('RSI') || r.explanation?.includes('EMA') || r.explanation?.includes('MACD'))
+                  ? 'real' : 'synthetic'
+              ),
             };
+          });
+          // Mirror live scan sort: real data first, then by confidence desc
+          rows.sort((a: any, b: any) => {
+            if (a.dataSource === 'real' && b.dataSource !== 'real') return -1;
+            if (b.dataSource === 'real' && a.dataSource !== 'real') return 1;
+            return b.confidence - a.confidence;
           });
         }
       } catch (e: any) {

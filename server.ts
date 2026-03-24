@@ -6494,14 +6494,15 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           prediction: r.prediction,
           confidence: r.confidence,
           predicted_price: r.predicted_price,
-          current_price: r.current_price,   // top-level column — history tab reads this
-          sector: r.sector,                  // top-level column — history tab reads this
+          current_price: r.current_price,
+          sector: r.sector,
           signals: {
             RSI: r.signals.RSI, MACD: r.signals.MACD,
             Volume: r.signals.Volume, Trend: r.signals.Trend,
             Sentiment: r.signals.Sentiment, Bollinger: r.signals.Bollinger,
             Stochastic: r.signals.Stochastic, Acceleration: r.signals.Acceleration,
             ATR: r.indicators.atr,
+            dataSource: r.dataSource,   // 'real' | 'synthetic' — used by history sort
           } as any,
           explanation: r.explanation,
         })));
@@ -6726,6 +6727,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
             ATR: r.indicators?.atr ?? 0,
             current_price: r.current_price ?? null,
             sector: r.sector ?? null,
+            dataSource: r.dataSource ?? 'synthetic',
           },
           explanation: r.explanation,
           created_at: Date.now(),

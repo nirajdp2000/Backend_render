@@ -734,8 +734,16 @@ const loadSupabaseUniverse = async (timeoutMs = 6000): Promise<void> => {
 
 const createUltraQuantUniverse = (): UltraQuantProfile[] => {
   // Fast path: return memoised result — but only if it's the full Supabase universe (>440 stocks)
-  // If cached is only the fallback (434), re-check in case Supabase data arrived since last call
   if (_cachedUniverse && _cachedUniverse.length > 440) return _cachedUniverse;
+
+  // If _universeState already has Supabase data (loaded via loadSupabaseUniverse), use it directly
+  if (_universeState.universe && _universeState.universe.length > 440) {
+    ultraQuantCache.clear();
+    multibaggerCache.clear();
+    _cachedUniverse = _universeState.universe;
+    console.log(`[Universe] Using ${_cachedUniverse.length} stocks from _universeState`);
+    return _cachedUniverse;
+  }
 
   // Check if startServerlessApp pre-loaded Supabase universe into global
   const globalUniverse = (global as any).__supabaseUniverse as Array<{ symbol: string; sector: string; industry: string; marketCap: number; averageVolume: number }> | undefined;
@@ -6251,6 +6259,10 @@ async function startServer() {
       nodeEnv: process.env.NODE_ENV || "development",
     });
     console.log(`Server running on http://localhost:${PORT}`);
+    // Load Supabase universe on startup (Render persistent server — not serverless)
+    loadSupabaseUniverse(10000).then(() => {
+      console.log(`[Universe] Startup load complete: ${_universeState.universe?.length ?? 0} stocks`);
+    }).catch(err => console.warn('[Universe] Startup load failed:', err.message));
     // Kick off full market universe load in background (doesn't block startup)
     initUniverse().catch(err =>
       console.warn('[StockUniverseService] Background init failed:', err.message)

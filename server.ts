@@ -4429,15 +4429,24 @@ Respond ONLY with this JSON structure (fill every field):
         sentimentTag,
         superbrain: runSuperbrain({
           symbol: profile.symbol, sector: profile.sector, marketCap: profile.marketCap,
-          // Annualise the cycle return properly: (1 + cycleReturn)^(365/cycleDays) - 1
-          cagr: cycleReturns[i] > -1
-            ? (Math.pow(1 + cycleReturns[i], 365 / cycleDays) - 1) * 100
-            : -50,
-          momentum: momentumResults[i].ret90 != null ? 1 + momentumResults[i].ret90 : 1,
-          trendStrength: trend,
-          // Derive volatility from ret30/ret90 spread (proxy for daily std-dev)
-          volatility: Math.abs((momentumResults[i].ret90 - momentumResults[i].ret30) / Math.sqrt(60)) || 0.018,
-          // Derive max drawdown from stability score (higher stability = lower drawdown)
+          // Clamp annualised CAGR to realistic range — raw annualisation of short cycles
+          // can produce 200-400% which breaks Superbrain's scoring bands.
+          // Cap at 60% (exceptional), floor at -50%.
+          cagr: Math.max(-50, Math.min(60,
+            cycleReturns[i] > -1
+              ? (Math.pow(1 + cycleReturns[i], 365 / cycleDays) - 1) * 100
+              : -50
+          )),
+          // momentum: 6-month price ratio. ret90 is a fraction (e.g. 0.15 = 15%).
+          // 1 + ret90 gives the correct ratio (e.g. 1.15). Clamp to [0.5, 2.0].
+          momentum: Math.max(0.5, Math.min(2.0, momentumResults[i].ret90 != null ? 1 + momentumResults[i].ret90 : 1)),
+          // trendStrength: Superbrain expects a slope value (range ~[-5, +5]).
+          // mbTrendScore returns 0-100. Map: (trend - 50) / 10 → [-5, +5].
+          trendStrength: (trend - 50) / 10,
+          // Volatility proxy from ret30/ret90 spread — clamp to realistic daily vol range
+          volatility: Math.max(0.008, Math.min(0.06,
+            Math.abs((momentumResults[i].ret90 - momentumResults[i].ret30) / Math.sqrt(60)) || 0.018
+          )),
           maxDrawdown: Math.max(5, (100 - stability) * 0.45),
           breakoutFrequency: breakout / 100,
           volumeGrowth: volumeResults[i].volRatio,
@@ -4453,11 +4462,16 @@ Respond ONLY with this JSON structure (fill every field):
           profitGrowth3yr: enriched?.screener?.profitGrowth3yr ?? null,
           salesGrowth3yr: enriched?.screener?.salesGrowth3yr ?? null,
           fundamentalScore: enriched ? computeFundamentalScore(enriched) : null,
-          sentimentScore: bullishScore,
+          // sentimentScore: use neutral 50 base — don't feed bullishScore directly as
+          // sentiment because it creates contradictions (bullishScore=80 → STRONG BULLISH
+          // badge while technical/momentum signals are low → STRONG SELL from Superbrain).
+          // Superbrain's own sentiment layer will compute from newsHeadlines + pChange.
+          sentimentScore: 50,
           newsHeadlines: enriched?.newsHeadlines ?? [],
           pChange: enriched?.yahoo?.pChange ?? null,
           bullishScore, trendScore: trend, relativeStrength: relStr,
           stabilityScore: stability,
+          // ret30/ret90/ret180 are percentages (e.g. 15.0 = 15%) — correct for Superbrain
           ret30: momentumResults[i].ret30 * 100,
           ret90: momentumResults[i].ret90 * 100,
           ret180: momentumResults[i].ret180 * 100,

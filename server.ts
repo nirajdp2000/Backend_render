@@ -6700,10 +6700,10 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     yesterday.setDate(yesterday.getDate() - 1);
     const dateToResolve = targetDate ?? yesterday.toISOString().slice(0, 10);
 
-    // Fetch ALL predictions for that date (filter null in code — avoids Supabase .is() issues)
+    // Fetch ALL predictions for that date (select only columns that exist in schema)
     const { data: rows, error } = await sb
       .from('predictions')
-      .select('id, stock_symbol, current_price, prediction, actual_price')
+      .select('id, stock_symbol, prediction, actual_price, signals')
       .eq('prediction_date', dateToResolve);
 
     if (error) {
@@ -6736,7 +6736,9 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           const actualPrice = last.close ?? last.c;
           if (!actualPrice || actualPrice <= 0) { failed++; return; }
 
-          const entryPrice = Number(row.current_price) || 0;
+          // current_price is in signals JSONB
+          const signals = typeof row.signals === 'string' ? JSON.parse(row.signals) : (row.signals ?? {});
+          const entryPrice = Number(signals.current_price) || 0;
           const actualChange = entryPrice > 0
             ? +((actualPrice - entryPrice) / entryPrice * 100).toFixed(2)
             : 0;
@@ -6782,7 +6784,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       if (!sb) return res.json({ error: 'no supabase' });
       const { data, error } = await sb
         .from('predictions')
-        .select('id, stock_symbol, current_price, actual_price, prediction_date')
+        .select('id, stock_symbol, actual_price, prediction_date, signals')
         .eq('prediction_date', req.params.date)
         .limit(5);
       res.json({ data, error, count: data?.length });
@@ -6820,8 +6822,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           prediction: r.prediction,
           confidence: r.confidence,
           predicted_price: r.predicted_price,
-          current_price: r.current_price ?? null,
-          sector: r.sector ?? null,
+          // No current_price/sector top-level — they don't exist in Supabase schema
           signals: {
             RSI: r.signals.RSI, MACD: r.signals.MACD,
             Volume: r.signals.Volume, Trend: r.signals.Trend,
@@ -6838,45 +6839,16 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
 
         const { error: insErr } = await sb.from('predictions').insert(rows);
         if (insErr) {
-          // Retry without top-level current_price/sector
-          console.log('[ForceSave] Insert failed:', insErr.message, '— retrying without top-level columns');
-          const rowsFallback = rows.map(({ current_price, sector, ...rest }: any) => rest);
-          const { error: insErr2 } = await sb.from('predictions').insert(rowsFallback);
-          if (insErr2) {
-            return res.status(500).json({ error: 'Insert failed: ' + insErr2.message, firstError: insErr.message });
-          }
+          return res.status(500).json({ error: 'Insert failed: ' + insErr.message });
         }
-        return res.json({ success: true, saved: allTop.length, date: today, deleted: delCount });
+        return res.json({ success: true, saved: allTop.length, date: today });
       }
 
-      // Fallback to service
-      await PredictionStorageService.saveAllPredictions(today, allTop.map((r: any) => ({
-        stock_symbol: r.stock,
-        prediction_date: today,
-        target_date: today,
-        prediction: r.prediction,
-        confidence: r.confidence,
-        predicted_price: r.predicted_price,
-        current_price: r.current_price,
-        sector: r.sector,
-        signals: {
-          RSI: r.signals.RSI, MACD: r.signals.MACD,
-          Volume: r.signals.Volume, Trend: r.signals.Trend,
-          Sentiment: r.signals.Sentiment, Bollinger: r.signals.Bollinger,
-          Stochastic: r.signals.Stochastic, Acceleration: r.signals.Acceleration,
-          ATR: r.indicators?.atr ?? 0,
-          current_price: r.current_price,
-          sector: r.sector,
-        },
-        explanation: r.explanation,
-      })));
       res.json({ success: true, saved: allTop.length, date: today });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   });
-
-  // ─── Rankings History Engine ──────────────────────────────────────────────
   // Stores daily top-50 snapshot on trading days for historical tracking.
   // Schema (Supabase table: rankings_history):
   //   id, snapshot_date, symbol, sector, rank, signal, confidence,

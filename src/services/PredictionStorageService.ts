@@ -98,12 +98,11 @@ export class PredictionStorageService {
     const sb = getSupabaseClient();
     if (sb) {
       try {
-        // Delete all existing for this date first
         const { error: delErr } = await sb.from('predictions').delete().eq('prediction_date', predictionDate);
         if (delErr) console.error('[PredictionStorage] Supabase delete error:', delErr.message);
 
-        // Always embed current_price + sector inside signals JSONB as guaranteed fallback
-        // so history tab can always read them even if top-level columns don't exist
+        // Only use columns that exist in the Supabase schema.
+        // current_price and sector do NOT exist as top-level columns — store in signals JSONB only.
         const rows = preds.map(pred => ({
           stock_symbol: pred.stock_symbol,
           prediction_date: pred.prediction_date,
@@ -111,11 +110,8 @@ export class PredictionStorageService {
           prediction: pred.prediction,
           confidence: pred.confidence,
           predicted_price: pred.predicted_price,
-          current_price: pred.current_price ?? null,
-          sector: pred.sector ?? null,
           signals: {
             ...pred.signals,
-            // Always store in signals JSONB as fallback for history tab
             current_price: pred.current_price ?? null,
             sector: pred.sector ?? null,
           },
@@ -125,17 +121,7 @@ export class PredictionStorageService {
 
         const { error } = await sb.from('predictions').insert(rows);
         if (!error) return;
-
-        // If current_price/sector top-level columns don't exist, retry without them
-        if (error.message?.includes('current_price') || error.message?.includes('sector') || error.message?.includes('column')) {
-          console.log('[PredictionStorage] Retrying without top-level current_price/sector columns...');
-          const rowsFallback = rows.map(({ current_price, sector, ...rest }) => rest);
-          const { error: e2 } = await sb.from('predictions').insert(rowsFallback);
-          if (!e2) { console.log('[PredictionStorage] Fallback insert succeeded'); return; }
-          console.error('[PredictionStorage] Supabase fallback insert error:', e2.message);
-        } else {
-          console.error('[PredictionStorage] Supabase batch insert error:', error.message);
-        }
+        console.error('[PredictionStorage] Supabase batch insert error:', error.message);
       } catch (e: any) {
         console.error('[PredictionStorage] Supabase batch exception:', e.message);
       }

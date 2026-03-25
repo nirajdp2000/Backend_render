@@ -7069,6 +7069,14 @@ async function startServer() {
       } catch (e: any) {
         console.warn('[Prewarm] Scan pre-warm failed:', e.message);
       }
+      // Pre-warm prediction scan on startup (trading days only) — ensures DB is always fresh
+      // after a Render restart. Runs 60s after universe load to let OHLCV cache warm up.
+      if (isMarketDay()) {
+        setTimeout(() => {
+          console.log('[StartupWarm] Pre-warming prediction scan on startup (trading day)...');
+          runPredictionScan().catch(e => console.warn('[StartupWarm] Prediction scan failed:', e.message));
+        }, 60_000);
+      }
     }).catch(err => console.warn('[Universe] Startup load failed:', err.message));
     // Kick off full market universe load in background (doesn't block startup)
     initUniverse().catch(err =>
@@ -7133,6 +7141,37 @@ async function startServer() {
         }).catch(e => console.warn('[EODScheduler] EOD refresh failed:', e.message));
       }
     }, 60_000); // check every minute
+
+    // ── Daily prediction scan scheduler: auto-run at 6:00 PM IST on trading days ──
+    // Runs after market close to capture EOD prices for next-day predictions.
+    // Also pre-warms at 8:00 AM IST before market opens.
+    let lastPredScanDate = '';
+    let lastPredMornDate = '';
+    setInterval(async () => {
+      const now = new Date();
+      const istOffset = 5.5 * 60 * 60_000;
+      const ist = new Date(now.getTime() + istOffset);
+      const hh = ist.getUTCHours();
+      const mm = ist.getUTCMinutes();
+      const day = ist.getUTCDay();
+      const dateKey = ist.toISOString().slice(0, 10);
+      const isTradingDay = day >= 1 && day <= 5 && !NSE_HOLIDAYS.has(dateKey);
+
+      // 6:00 PM IST — EOD scan after market close, saves to DB
+      if (hh === 18 && mm === 0 && isTradingDay && dateKey !== lastPredScanDate) {
+        lastPredScanDate = dateKey;
+        console.log(`[PredScheduler] EOD prediction scan at 6:00 PM IST (${dateKey})`);
+        predCache = null;
+        runPredictionScan().catch(e => console.error('[PredScheduler] EOD scan error:', e.message));
+      }
+      // 8:00 AM IST — morning pre-warm
+      if (hh === 8 && mm === 0 && isTradingDay && dateKey !== lastPredMornDate) {
+        lastPredMornDate = dateKey;
+        console.log(`[PredScheduler] Morning prediction pre-warm at 8:00 AM IST (${dateKey})`);
+        predCache = null;
+        runPredictionScan().catch(e => console.error('[PredScheduler] Morning scan error:', e.message));
+      }
+    }, 60_000);
   });
 
   // Graceful shutdown handler

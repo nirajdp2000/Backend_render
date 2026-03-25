@@ -6688,6 +6688,82 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     }
   });
 
+  // ── Auto-resolve actual prices for past prediction dates ──────────────────
+  // Fetches real closing prices from Yahoo Finance for each predicted stock
+  // and updates actual_price / actual_change in the DB.
+  async function resolveActualPrices(targetDate?: string): Promise<{ resolved: number; failed: number; date: string }> {
+    const sb = getSupabaseClient();
+    if (!sb) return { resolved: 0, failed: 0, date: targetDate ?? '' };
+
+    // Default: resolve yesterday's predictions (the day after prediction_date)
+    const ist = istNow();
+    const yesterday = new Date(ist);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const dateToResolve = targetDate ?? yesterday.toISOString().slice(0, 10);
+
+    // Get all unresolved predictions for that date
+    const { data: rows, error } = await sb
+      .from('predictions')
+      .select('id, stock_symbol, current_price, prediction')
+      .eq('prediction_date', dateToResolve)
+      .is('actual_price', null);
+
+    if (error || !rows || rows.length === 0) {
+      console.log(`[ActualResolver] No unresolved predictions for ${dateToResolve}`);
+      return { resolved: 0, failed: 0, date: dateToResolve };
+    }
+
+    console.log(`[ActualResolver] Resolving ${rows.length} predictions for ${dateToResolve}...`);
+    let resolved = 0, failed = 0;
+
+    // Fetch in batches of 10 to avoid hammering Yahoo
+    for (let i = 0; i < rows.length; i += 10) {
+      const batch = rows.slice(i, i + 10);
+      await Promise.allSettled(batch.map(async (row: any) => {
+        try {
+          const candles = await fetchRealOHLCV(row.stock_symbol);
+          if (!candles || candles.length === 0) { failed++; return; }
+
+          // Use the most recent close as actual price
+          const actualPrice = candles[candles.length - 1].close ?? (candles[candles.length - 1] as any).c;
+          if (!actualPrice || actualPrice <= 0) { failed++; return; }
+
+          const entryPrice = row.current_price ?? 0;
+          const actualChange = entryPrice > 0
+            ? +((actualPrice - entryPrice) / entryPrice * 100).toFixed(2)
+            : 0;
+
+          await PredictionStorageService.updateActualPrice(row.id, +actualPrice.toFixed(2), actualChange);
+          resolved++;
+        } catch (_e) { failed++; }
+      }));
+      if (i + 10 < rows.length) await new Promise<void>(r => setTimeout(r, 300));
+    }
+
+    console.log(`[ActualResolver] Done — resolved: ${resolved}, failed: ${failed} for ${dateToResolve}`);
+    return { resolved, failed, date: dateToResolve };
+  }
+
+  // Endpoint to manually trigger resolution (or auto-trigger via cron)
+  app.post("/api/predictions/resolve-actuals", express.json(), async (req, res) => {
+    try {
+      const { date } = req.body ?? {};
+      const result = await resolveActualPrices(date);
+      res.json({ success: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/predictions/resolve-actuals/:date", async (req, res) => {
+    try {
+      const result = await resolveActualPrices(req.params.date);
+      res.json({ success: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // Force-save current prediction cache to DB (admin endpoint for manual refresh)
   app.post("/api/predictions/force-save", async (req, res) => {
     try {
@@ -7077,6 +7153,33 @@ async function startServer() {
           runPredictionScan().catch(e => console.warn('[StartupWarm] Prediction scan failed:', e.message));
         }, 60_000);
       }
+      // On startup, resolve actual prices for any unresolved past prediction dates
+      setTimeout(async () => {
+        try {
+          const sb = getSupabaseClient();
+          if (!sb) return;
+          const { data: dates } = await sb
+            .from('predictions')
+            .select('prediction_date')
+            .is('actual_price', null)
+            .order('prediction_date', { ascending: false })
+            .limit(100);
+          if (!dates) return;
+          const uniqueDates = [...new Set(dates.map((r: any) => r.prediction_date as string))];
+          const ist = istNow();
+          const today = ist.toISOString().slice(0, 10);
+          // Only resolve past dates (not today — market may still be open)
+          const pastDates = uniqueDates.filter(d => d < today);
+          if (pastDates.length === 0) { console.log('[StartupResolve] No past unresolved dates'); return; }
+          console.log(`[StartupResolve] Resolving actuals for ${pastDates.length} past dates: ${pastDates.join(', ')}`);
+          for (const d of pastDates) {
+            await resolveActualPrices(d).catch(e => console.warn(`[StartupResolve] ${d} failed:`, e.message));
+            await new Promise<void>(r => setTimeout(r, 2000)); // 2s between dates
+          }
+        } catch (e: any) {
+          console.warn('[StartupResolve] Error:', e.message);
+        }
+      }, 90_000); // 90s after startup — let OHLCV cache warm first
     }).catch(err => console.warn('[Universe] Startup load failed:', err.message));
     // Kick off full market universe load in background (doesn't block startup)
     initUniverse().catch(err =>
@@ -7164,12 +7267,18 @@ async function startServer() {
         predCache = null;
         runPredictionScan().catch(e => console.error('[PredScheduler] EOD scan error:', e.message));
       }
-      // 8:00 AM IST — morning pre-warm
+      // 8:00 AM IST — morning pre-warm + resolve yesterday's actual prices
       if (hh === 8 && mm === 0 && isTradingDay && dateKey !== lastPredMornDate) {
         lastPredMornDate = dateKey;
         console.log(`[PredScheduler] Morning prediction pre-warm at 8:00 AM IST (${dateKey})`);
         predCache = null;
         runPredictionScan().catch(e => console.error('[PredScheduler] Morning scan error:', e.message));
+        // Resolve actual prices for yesterday's predictions (previous trading day)
+        resolveActualPrices().catch(e => console.error('[PredScheduler] Resolve actuals error:', e.message));
+      }
+      // 4:00 PM IST — resolve today's actual prices (market just closed)
+      if (hh === 16 && mm === 0 && isTradingDay) {
+        resolveActualPrices(dateKey).catch(e => console.error('[PredScheduler] EOD resolve error:', e.message));
       }
     }, 60_000);
   });

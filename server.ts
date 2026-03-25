@@ -6691,53 +6691,64 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
   // ── Auto-resolve actual prices for past prediction dates ──────────────────
   // Fetches real closing prices from Yahoo Finance for each predicted stock
   // and updates actual_price / actual_change in the DB.
-  async function resolveActualPrices(targetDate?: string): Promise<{ resolved: number; failed: number; date: string }> {
+  async function resolveActualPrices(targetDate?: string): Promise<{ resolved: number; failed: number; date: string; error?: string }> {
     const sb = getSupabaseClient();
     if (!sb) return { resolved: 0, failed: 0, date: targetDate ?? '' };
 
-    // Default: resolve yesterday's predictions (the day after prediction_date)
     const ist = istNow();
     const yesterday = new Date(ist);
     yesterday.setDate(yesterday.getDate() - 1);
     const dateToResolve = targetDate ?? yesterday.toISOString().slice(0, 10);
 
-    // Get all unresolved predictions for that date
+    // Fetch ALL predictions for that date (filter null in code — avoids Supabase .is() issues)
     const { data: rows, error } = await sb
       .from('predictions')
-      .select('id, stock_symbol, current_price, prediction')
-      .eq('prediction_date', dateToResolve)
-      .is('actual_price', null);
+      .select('id, stock_symbol, current_price, prediction, actual_price')
+      .eq('prediction_date', dateToResolve);
 
-    if (error || !rows || rows.length === 0) {
-      console.log(`[ActualResolver] No unresolved predictions for ${dateToResolve}`);
+    if (error) {
+      console.error(`[ActualResolver] Supabase query error for ${dateToResolve}:`, error.message);
+      return { resolved: 0, failed: 0, date: dateToResolve, error: error.message };
+    }
+    if (!rows || rows.length === 0) {
+      console.log(`[ActualResolver] No predictions found for ${dateToResolve}`);
       return { resolved: 0, failed: 0, date: dateToResolve };
     }
 
-    console.log(`[ActualResolver] Resolving ${rows.length} predictions for ${dateToResolve}...`);
+    // Only process rows without actual_price
+    const unresolved = rows.filter((r: any) => r.actual_price == null);
+    if (unresolved.length === 0) {
+      console.log(`[ActualResolver] All ${rows.length} predictions already resolved for ${dateToResolve}`);
+      return { resolved: 0, failed: 0, date: dateToResolve };
+    }
+
+    console.log(`[ActualResolver] Resolving ${unresolved.length}/${rows.length} predictions for ${dateToResolve}...`);
     let resolved = 0, failed = 0;
 
-    // Fetch in batches of 10 to avoid hammering Yahoo
-    for (let i = 0; i < rows.length; i += 10) {
-      const batch = rows.slice(i, i + 10);
+    for (let i = 0; i < unresolved.length; i += 10) {
+      const batch = unresolved.slice(i, i + 10);
       await Promise.allSettled(batch.map(async (row: any) => {
         try {
           const candles = await fetchRealOHLCV(row.stock_symbol);
           if (!candles || candles.length === 0) { failed++; return; }
 
-          // Use the most recent close as actual price
-          const actualPrice = candles[candles.length - 1].close ?? (candles[candles.length - 1] as any).c;
+          const last = candles[candles.length - 1] as any;
+          const actualPrice = last.close ?? last.c;
           if (!actualPrice || actualPrice <= 0) { failed++; return; }
 
-          const entryPrice = row.current_price ?? 0;
+          const entryPrice = Number(row.current_price) || 0;
           const actualChange = entryPrice > 0
             ? +((actualPrice - entryPrice) / entryPrice * 100).toFixed(2)
             : 0;
 
           await PredictionStorageService.updateActualPrice(row.id, +actualPrice.toFixed(2), actualChange);
           resolved++;
-        } catch (_e) { failed++; }
+        } catch (e: any) {
+          console.warn(`[ActualResolver] ${row.stock_symbol} failed:`, e.message);
+          failed++;
+        }
       }));
-      if (i + 10 < rows.length) await new Promise<void>(r => setTimeout(r, 300));
+      if (i + 10 < unresolved.length) await new Promise<void>(r => setTimeout(r, 300));
     }
 
     console.log(`[ActualResolver] Done — resolved: ${resolved}, failed: ${failed} for ${dateToResolve}`);
@@ -6759,6 +6770,22 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     try {
       const result = await resolveActualPrices(req.params.date);
       res.json({ success: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Debug: show raw Supabase rows for a date (to diagnose resolver issues)
+  app.get("/api/predictions/debug/:date", async (req, res) => {
+    try {
+      const sb = getSupabaseClient();
+      if (!sb) return res.json({ error: 'no supabase' });
+      const { data, error } = await sb
+        .from('predictions')
+        .select('id, stock_symbol, current_price, actual_price, prediction_date')
+        .eq('prediction_date', req.params.date)
+        .limit(5);
+      res.json({ data, error, count: data?.length });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

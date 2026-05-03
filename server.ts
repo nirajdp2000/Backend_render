@@ -19,6 +19,7 @@ import { fetchNewsIntelligence, getStockSentiment, getTopNews, getSectorSentimen
 import { enrichStocksBackground, getEnrichedFromCache, fetchFIIDIIData, computeFundamentalScore, fetchYahooFundamentals, fetchScreenerFundamentals, isYahooCached, loadFundamentalsFromSupabase, loadOHLCVFromSupabase, writeOHLCVToSupabase, type EnrichedStockData, type OHLCVCandle } from "./src/services/MarketDataAggregator";
 import { runSuperbrain, type SuperbrainInput, resolveOutcomes, getSuperbrainStats } from "./src/services/SuperbrainEngine";
 import { startUniverseSyncScheduler, syncUniverseToSupabase } from "./src/services/UniverseSyncService";
+import { deriveAiSignal, mapNewsItemForDashboard, pickCandleForDate } from "./src/services/aiIntelligenceRules";
 
 import path from "path";
 import fs from "fs";
@@ -122,6 +123,8 @@ async function buildApp() {
   };
 
   type UltraQuantCandle = {
+    date?: string;
+    timestamp?: number;
     open: number;
     high: number;
     low: number;
@@ -1028,7 +1031,15 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
         for (let i = 0; i < timestamps.length; i++) {
           const o = q.open?.[i], h = q.high?.[i], l = q.low?.[i], c = q.close?.[i], v = q.volume?.[i];
           if (o == null || h == null || l == null || c == null || c <= 0) continue;
-          candles.push({ open: o, high: h, low: l, close: c, volume: v ?? 0 });
+          candles.push({
+            date: new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
+            timestamp: timestamps[i],
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: v ?? 0,
+          });
         }
         if (candles.length < 60) continue;
 
@@ -5060,7 +5071,7 @@ Respond ONLY with this JSON structure (fill every field):
       'earthquake', 'flood', 'cyclone', 'disaster', 'tsunami', 'pandemic', 'outbreak',
       'fraud', 'scam', 'default', 'bankruptcy', 'crisis', 'collapse', 'terror'];
     const newsGeoRisk = recentNews.reduce((risk, item) => {
-      const text = (item.title + ' ' + (item.summary ?? '')).toLowerCase();
+      const text = (item.headline + ' ' + (item.summary ?? '')).toLowerCase();
       const hits = geoKeywords.filter(kw => text.includes(kw)).length;
       return risk + Math.min(0.05, hits * 0.02); // max 0.05 per article
     }, 0);
@@ -5170,14 +5181,32 @@ Respond ONLY with this JSON structure (fill every field):
       };
       const drift0 = sectorDrift[profile.sector] ?? 0.001;
 
-      const closes: number[] = [];
-      const volumes: number[] = [];
-      let price = 80 + rng() * 1800;
-      for (let d = 0; d < totalDays; d++) {
-        const drift = drift0 + Math.sin(d / 31 + rng()) * 0.006 + (rng() - 0.5) * 0.05;
-        price = Math.max(20, price * (1 + drift));
-        closes.push(price);
-        volumes.push(profile.averageVolume * (0.85 + rng() * 0.9) * (1 + Math.max(0, drift * 10)));
+      let closes: number[] = [];
+      let volumes: number[] = [];
+      const cachedSeries = realOHLCVCache.get(profile.symbol);
+      const hasRealSeries = !!cachedSeries && cachedSeries.expiresAt > Date.now() && cachedSeries.candles.length >= 60;
+      let scoreSource: 'real' | 'synthetic' = hasRealSeries ? 'real' : 'synthetic';
+
+      if (hasRealSeries) {
+        const realCandles = cachedSeries.candles.slice(-totalDays);
+        closes = realCandles.map(c => Number(c.close)).filter(c => Number.isFinite(c) && c > 0);
+        volumes = realCandles.map(c => Number(c.volume) || profile.averageVolume || 0);
+        if (cachedSeries.livePrice && cachedSeries.livePrice > 0 && closes.length > 0) {
+          closes[closes.length - 1] = cachedSeries.livePrice;
+        }
+      }
+
+      if (closes.length < 60) {
+        closes = [];
+        volumes = [];
+        scoreSource = 'synthetic';
+        let price = 80 + rng() * 1800;
+        for (let d = 0; d < totalDays; d++) {
+          const drift = drift0 + Math.sin(d / 31 + rng()) * 0.006 + (rng() - 0.5) * 0.05;
+          price = Math.max(20, price * (1 + drift));
+          closes.push(price);
+          volumes.push(profile.averageVolume * (0.85 + rng() * 0.9) * (1 + Math.max(0, drift * 10)));
+        }
       }
 
       const cur = closes[closes.length - 1];
@@ -5339,11 +5368,7 @@ Respond ONLY with this JSON structure (fill every field):
         0.10 * aiScore
       );
 
-      const signal = finalScore > 0.72 && rlAction === "BUY" ? "STRONG BUY"
-        : finalScore > 0.55 ? "BUY"
-        : finalScore > 0.38 ? "HOLD"
-        : "SELL";
-      const confidence = finalScore > 0.72 ? "HIGH" : finalScore > 0.48 ? "MEDIUM" : "LOW";
+      const { signal, confidence } = deriveAiSignal(finalScore, rlAction);
 
       // Module 9 — Alerts (thresholds tuned for synthetic + live data)
       const ts = new Date().toISOString();
@@ -5386,6 +5411,8 @@ Respond ONLY with this JSON structure (fill every field):
         orderImbalance: +orderImbalance.toFixed(2), institutionalSignal,
         institutionalScore: +instScore.toFixed(2), aiPredictionScore: +aiScore.toFixed(2),
         marketRegime: regime, rlAction, finalScore: +finalScore.toFixed(2),
+        scoreSource,
+        isActionable: scoreSource === 'real' && (signal === "STRONG BUY" || signal === "BUY" || signal === "SELL"),
         alerts, signal, confidence, rank: 0,
         // ORB/VWAP enrichment (present when real data available)
         ...(orbData ? {
@@ -5451,18 +5478,9 @@ Respond ONLY with this JSON structure (fill every field):
       return "Medium-Term (1-4 weeks)";
     };
 
-    // Assign signals to top 50 (relative ranking within top 50)
+    // Assign absolute signals to top 50. Labels must reflect evidence, not forced buckets.
     const top50WithSignals = top50Slice.map((r, i) => {
-      const signal =
-        i < sb50Cut   ? "STRONG BUY"
-        : i < buy50Cut  ? "BUY"
-        : i < hold50Cut ? "HOLD"
-        : "SELL";
-      const confidence =
-        i < sb50Cut   ? "HIGH"
-        : i < buy50Cut  ? "HIGH"
-        : i < hold50Cut ? "MEDIUM"
-        : "LOW";
+      const { signal, confidence } = deriveAiSignal(r.finalScore, r.rlAction);
       return {
         ...r, signal, confidence,
         timeHorizon: timeHorizon(r, i),
@@ -5471,18 +5489,9 @@ Respond ONLY with this JSON structure (fill every field):
       };
     });
 
-    // Assign signals to full universe (for summary counts and alerts)
+    // Assign absolute signals to full universe (for summary counts and alerts)
     const rankedWithSignals = ranked.map((r, i) => {
-      const signal =
-        i < strongBuyCutoff ? "STRONG BUY"
-        : i < buyCutoff     ? "BUY"
-        : i < holdCutoff    ? "HOLD"
-        : "SELL";
-      const confidence =
-        i < strongBuyCutoff ? "HIGH"
-        : i < buyCutoff     ? "HIGH"
-        : i < holdCutoff    ? "MEDIUM"
-        : "LOW";
+      const { signal, confidence } = deriveAiSignal(r.finalScore, r.rlAction);
       return {
         ...r, signal, confidence,
         timeHorizon: timeHorizon(r, i),
@@ -5491,13 +5500,13 @@ Respond ONLY with this JSON structure (fill every field):
       };
     });
 
-    // rankings: top 50 with signals assigned within the top 50 (all 4 signal types guaranteed)
+    // rankings: top 50 with absolute signals
     const top50 = top50WithSignals;
     const allRanked = rankedWithSignals;
 
     // ── Real price overlay: fetch live Yahoo Finance prices for top 50 symbols ──
     // This overlays currentPrice, priceChange, priceChangePercent with real market data.
-    // Scoring pipeline is unaffected (uses synthetic candles). Only display fields change.
+    // scoreSource remains separate, so the UI can distinguish live price from live-scored signals.
     let realPrices: Map<string, { price: number; changePct: number }> = new Map();
     try {
       const top50Symbols = top50.map((r: any) => r.symbol);
@@ -5531,7 +5540,9 @@ Respond ONLY with this JSON structure (fill every field):
 
     // liveAlerts: collect from ALL ranked stocks (not just top 30)
     const liveAlerts = rankedWithSignals
-      .flatMap(r => r.alerts)
+      .flatMap(r => (r.alerts || [])
+        .filter((a: any) => r.scoreSource === 'real' || (a.alertType !== 'RALLY' && a.alertType !== 'VOLUME'))
+        .map((a: any) => ({ ...a, scoreSource: r.scoreSource, isActionable: r.isActionable })))
       .sort((a: any, b: any) => {
         // HIGH severity first, then by confidenceScore
         if (a.severity === 'HIGH' && b.severity !== 'HIGH') return -1;
@@ -5558,23 +5569,7 @@ Respond ONLY with this JSON structure (fill every field):
     // Build real news feed — use live RSS items when available, fall back to synthetic
     const realTopNews = newsIntel ? getTopNews(30) : [];
     const realNewsFeed = realTopNews.length > 0
-      ? realTopNews.map((item, i) => ({
-          symbol: item.tickers[0] || null,
-          headline: item.title,
-          sector: item.sectors[0] || 'General',
-          impact: item.impact.level,
-          sentiment: item.sentiment.label,
-          source: item.source,
-          credibilityScore: +item.credibility.toFixed(2),
-          verified: item.verified,
-          fakeNewsFlags: item.fakeNewsFlags,
-          priceChange: undefined,
-          volumeSpike: undefined,
-          aiScore: Math.round(item.impact.score * 100),
-          timestamp: item.publishedAt,
-          type: item.tickers.length > 0 ? 'stock' : 'macro',
-          rallyRelevance: item.sentiment.label === 'POSITIVE' ? 'WATCHLIST' : undefined,
-        }))
+      ? realTopNews.map(item => mapNewsItemForDashboard(item))
       : top50WithRealPrices.slice(0, 20).map((r, i) => ({
           symbol: r.symbol,
           headline: `${r.symbol} (${r.sector}): ${r.signal} signal — score ${Math.round(r.finalScore * 100)}, vol spike ${r.volumeSpike.toFixed(1)}x, ${r.priceChangePercent >= 0 ? 'up' : 'down'} ${Math.abs(r.priceChangePercent).toFixed(2)}% today`,
@@ -5592,7 +5587,7 @@ Respond ONLY with this JSON structure (fill every field):
           type: 'stock',
         }));
 
-    const payload = {
+    const payload: any = {
       rankings: top50WithRealPrices,  // Top 50 with real prices overlaid where available
       earlyRallyCandidates,
       liveAlerts,
@@ -5651,6 +5646,7 @@ Respond ONLY with this JSON structure (fill every field):
         volumeSpike: 1,
         dataSource: 'synthetic',
         priceSource: 'synthetic',
+        isActionable: false,
         // Keep earlyRallySignal, rallyProbabilityScore, institutionalSignal, alerts intact
         // Filter out intraday-only alert types (RALLY, VOLUME) — keep AI/INSTITUTIONAL/NEWS
         alerts: (r.alerts || []).filter((a: any) => a.alertType !== 'RALLY' && a.alertType !== 'VOLUME'),
@@ -5669,6 +5665,7 @@ Respond ONLY with this JSON structure (fill every field):
           dataSource: 'synthetic',
           orbSignal: 'NONE',
           marketClosedWatchlist: true,
+          isActionable: false,
           // Keep rallyProbabilityScore and earlyRallySignal for display
         }));
       // liveAlerts: keep AI_PREDICTION, INSTITUTIONAL, NEWS alerts — drop RALLY/VOLUME (intraday)
@@ -6441,7 +6438,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           try {
             const result = predictStock(p.symbol, p.sector || 'Unknown', p.exchange || 'NSE', p.averageVolume || 0);
             if (!result) continue;
-            result.dataSource = 'synthetic';
+            (result as any).dataSource = 'synthetic';
             syntheticCount++;
             if (result.prediction === 'Bullish') bullish.push(result);
             else bearish.push(result);
@@ -6703,7 +6700,7 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
     // Fetch ALL predictions for that date (select only columns that exist in schema)
     const { data: rows, error } = await sb
       .from('predictions')
-      .select('id, stock_symbol, prediction, actual_price, signals')
+      .select('id, stock_symbol, prediction, actual_price, signals, target_date')
       .eq('prediction_date', dateToResolve);
 
     if (error) {
@@ -6732,8 +6729,9 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
           const candles = await fetchRealOHLCV(row.stock_symbol);
           if (!candles || candles.length === 0) { failed++; return; }
 
-          const last = candles[candles.length - 1] as any;
-          const actualPrice = last.close ?? last.c;
+          const target = String(row.target_date || dateToResolve).slice(0, 10);
+          const actualCandle = pickCandleForDate(candles as any[], target);
+          const actualPrice = actualCandle ? (actualCandle.close ?? (actualCandle as any).c) : null;
           if (!actualPrice || actualPrice <= 0) { failed++; return; }
 
           // current_price is in signals JSONB
@@ -7019,32 +7017,19 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
       const today = istNow().toISOString().slice(0, 10);
       const horizonAvailable = outcomeDate <= today;
 
-      // Reproduce the seeded closing price for any (symbol, sector, dateStr).
-      // Uses the exact same generator as buildAIIntelligenceDashboard.
-      const syntheticPrice = (symbol: string, sector: string, dateStr: string): number => {
-        const dateSeed = parseInt(dateStr.replace(/-/g, ''), 10);
-        const rng = seededGenerator((symbolSeed(symbol) ^ 0xdeadbeef) ^ (dateSeed >>> 0));
-        const sectorDrift: Record<string, number> = {
-          Technology: 0.00165, Financials: 0.0012, Energy: 0.0011,
-          Healthcare: 0.00145, Consumer: 0.00115, Industrials: 0.00105,
-          Telecom: 0.001, Materials: 0.00095,
-        };
-        const drift0 = sectorDrift[sector] ?? 0.001;
-        let price = 80 + rng() * 1800;
-        for (let d = 0; d < 260; d++) {
-          const drift = drift0 + Math.sin(d / 31 + rng()) * 0.006 + (rng() - 0.5) * 0.05;
-          price = Math.max(20, price * (1 + drift));
-        }
-        return price;
-      };
-
       const rows = await getRankingsByDate(snapshotDate);
       if (!rows.length) return res.json({ snapshotDate, outcomeDate, horizon, horizonAvailable, outcomes: [], accuracy: null });
 
-      const outcomes = rows.map(r => {
-        const p0 = syntheticPrice(r.symbol, r.sector, snapshotDate);
-        const p1 = horizonAvailable ? syntheticPrice(r.symbol, r.sector, outcomeDate) : null;
-        const pctChange = p1 !== null ? +((p1 - p0) / p0 * 100).toFixed(2) : null;
+      const closeOf = (candle: any): number | null => {
+        const close = Number(candle?.close ?? candle?.c);
+        return Number.isFinite(close) && close > 0 ? close : null;
+      };
+
+      const outcomes = await Promise.all(rows.map(async r => {
+        const candles = await fetchRealOHLCV(r.symbol).catch(() => null);
+        const p0 = closeOf(pickCandleForDate((candles ?? []) as any[], snapshotDate));
+        const p1 = horizonAvailable ? closeOf(pickCandleForDate((candles ?? []) as any[], outcomeDate)) : null;
+        const pctChange = p0 !== null && p1 !== null ? +((p1 - p0) / p0 * 100).toFixed(2) : null;
         // A BUY/STRONG BUY is a "hit" if price went up; SELL is a hit if price went down
         const hit = pctChange !== null
           ? (r.signal === 'STRONG BUY' || r.signal === 'BUY') ? pctChange > 0
@@ -7052,9 +7037,9 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
             : null
           : null;
         return { rank: r.rank, symbol: r.symbol, sector: r.sector, signal: r.signal, confidence: r.confidence,
-          final_score: r.final_score, priceAtSnapshot: +p0.toFixed(2),
+          final_score: r.final_score, priceAtSnapshot: p0 !== null ? +p0.toFixed(2) : null,
           priceAtOutcome: p1 !== null ? +p1.toFixed(2) : null, pctChange, hit };
-      });
+      }));
 
       // Accuracy stats (only when outcome is available)
       let accuracy = null;
@@ -7064,14 +7049,20 @@ Generate stockNews for ALL ${Math.min(15, base.rankings.length)} stocks. Generat
         const buys = outcomes.filter(o => o.signal === 'BUY');
         const hitCount = outcomes.filter(o => o.hit === true).length;
         const totalSignaled = outcomes.filter(o => o.hit !== null).length;
-        const avgReturn = (arr: typeof outcomes) => arr.length
-          ? +(arr.reduce((s, o) => s + (o.pctChange ?? 0), 0) / arr.length).toFixed(2) : 0;
+        const avgReturn = (arr: typeof outcomes) => {
+          const resolved = arr.filter(o => o.pctChange !== null);
+          return resolved.length
+            ? +(resolved.reduce((s, o) => s + (o.pctChange ?? 0), 0) / resolved.length).toFixed(2)
+            : 0;
+        };
+        const resolvedStrongBuys = strongBuys.filter(o => o.hit !== null);
+        const resolvedBuys = buys.filter(o => o.hit !== null);
         accuracy = {
           overallHitRate: totalSignaled > 0 ? +(hitCount / totalSignaled * 100).toFixed(1) : 0,
-          strongBuyHitRate: strongBuys.length > 0
-            ? +(strongBuys.filter(o => o.hit).length / strongBuys.length * 100).toFixed(1) : 0,
-          buyHitRate: buys.length > 0
-            ? +(buys.filter(o => o.hit).length / buys.length * 100).toFixed(1) : 0,
+          strongBuyHitRate: resolvedStrongBuys.length > 0
+            ? +(resolvedStrongBuys.filter(o => o.hit).length / resolvedStrongBuys.length * 100).toFixed(1) : 0,
+          buyHitRate: resolvedBuys.length > 0
+            ? +(resolvedBuys.filter(o => o.hit).length / resolvedBuys.length * 100).toFixed(1) : 0,
           avgReturnStrongBuy: avgReturn(strongBuys),
           avgReturnBuy: avgReturn(buys),
           avgReturnAll: avgReturn(buySignals),

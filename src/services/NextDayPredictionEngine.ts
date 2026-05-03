@@ -21,7 +21,7 @@ export interface Candle {
 export interface PredictionSignals {
   RSI: number;       // -1 to +1
   MACD: number;      // -1 to +1
-  Volume: number;    // 0 to +1
+  Volume: number;    // -1 to +1, directional by price action/trend
   Trend: number;     // -1 or +1
   Sentiment: number; // -1 to +1
   Bollinger: number; // -1 to +1
@@ -164,11 +164,16 @@ export class NextDayPredictionEngine {
     const price = candles[candles.length - 1].close;
     const macdNorm = price > 0 ? Math.max(-1, Math.min(1, macd.histogram / (price * 0.005))) : (macd.histogram > 0 ? 1 : -1);
 
-    // Volume: 0 to +1 (high volume is always a positive signal for momentum)
-    const volumeScore = Math.min(1, Math.max(0, (volumeRatio - 0.5) / 2));
-
     // Trend: EMA crossover — continuous, not binary
     const trendScore = ema50 > 0 ? Math.max(-1, Math.min(1, (ema20 - ema50) / (ema50 * 0.02))) : 0;
+
+    // Volume confirms direction: high volume on red candles/downtrend is bearish.
+    const prevClose = candles[candles.length - 2]?.close ?? price;
+    const priceDirection = price > prevClose ? 1 : price < prevClose ? -1 : 0;
+    const fallbackDirection = Math.sign(macdNorm + trendScore) || 1;
+    const volumeDirection = priceDirection || fallbackDirection;
+    const volumeMagnitude = Math.min(1, Math.max(0, (volumeRatio - 0.5) / 2));
+    const volumeScore = volumeMagnitude * volumeDirection;
 
     // Bollinger position already -1 to +1
     const bollingerScore = bollinger.position;
@@ -211,7 +216,7 @@ export class NextDayPredictionEngine {
 
     // Signal agreement: what fraction of signals agree with the prediction direction
     const direction = score > 0 ? 1 : -1;
-    const signalArr = [signals.RSI, signals.MACD, signals.Volume * direction, signals.Trend, signals.Sentiment, signals.Bollinger];
+    const signalArr = [signals.RSI, signals.MACD, signals.Volume, signals.Trend, signals.Sentiment, signals.Bollinger];
     const agreeing = signalArr.filter(s => s * direction > 0.1).length;
     const agreementFactor = 0.4 + 0.6 * (agreeing / signalArr.length);
 

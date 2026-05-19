@@ -685,6 +685,8 @@ const _universeState = {
   loading: false,
   globalApplied: false,
 };
+const FULL_UNIVERSE_MIN_SIZE = Number(process.env.FULL_UNIVERSE_MIN_SIZE || '1000');
+const hasFullUniverse = (count: number | null | undefined) => (count ?? 0) >= FULL_UNIVERSE_MIN_SIZE;
 
 /**
  * Seed embedded universe immediately, then upgrade to Supabase 5000+ in background.
@@ -709,7 +711,7 @@ const getUniverseSync = (): UltraQuantProfile[] => {
 const loadSupabaseUniverse = async (timeoutMs = 10000): Promise<void> => {
   if (_universeState.loading) return;
   // Already have full universe — skip
-  if (_universeState.universe && _universeState.universe.length > 440) return;
+  if (_universeState.universe && hasFullUniverse(_universeState.universe.length)) return;
   _universeState.loading = true;
   try {
     const supabase = getSupabaseClient();
@@ -732,7 +734,7 @@ const loadSupabaseUniverse = async (timeoutMs = 10000): Promise<void> => {
         from += PAGE_SIZE;
         if (data.length < PAGE_SIZE) done = true;
       }
-      if (allRows.length > 0) {
+      if (hasFullUniverse(allRows.length)) {
         const curatedMap = new Map(NSE_STOCK_UNIVERSE.map(s => [s.symbol, s]));
         _universeState.universe = allRows.map(row => {
           const c = curatedMap.get(row.symbol);
@@ -748,6 +750,24 @@ const loadSupabaseUniverse = async (timeoutMs = 10000): Promise<void> => {
         multibaggerCache.clear();
         _cachedUniverse = null;
         console.log(`[Universe] Loaded ${_universeState.universe.length} stocks from Supabase`);
+      } else {
+        if (allRows.length > 0) {
+          console.warn(`[Universe] Supabase returned only ${allRows.length} rows; asking StockUniverseService for Upstox fallback`);
+        }
+        const serviceUniverse = await getUniverseAsync();
+        if (serviceUniverse.length > 0) {
+          _universeState.universe = serviceUniverse.map(row => ({
+            symbol: row.symbol,
+            sector: row.sector || 'Unknown',
+            industry: row.industry || 'Unknown',
+            marketCap: Number(row.marketCap) || 1000,
+            averageVolume: Number(row.averageVolume) || 100000,
+          }));
+          ultraQuantCache.clear();
+          multibaggerCache.clear();
+          _cachedUniverse = null;
+          console.log(`[Universe] Loaded ${_universeState.universe.length} stocks from StockUniverseService`);
+        }
       }
     };
 
@@ -760,11 +780,11 @@ const loadSupabaseUniverse = async (timeoutMs = 10000): Promise<void> => {
 };
 
 const createUltraQuantUniverse = (): UltraQuantProfile[] => {
-  // Fast path: return memoised result — but only if it's the full Supabase universe (>440 stocks)
-  if (_cachedUniverse && _cachedUniverse.length > 440) return _cachedUniverse;
+  // Fast path: return memoised result only when it is a real full-size universe.
+  if (_cachedUniverse && hasFullUniverse(_cachedUniverse.length)) return _cachedUniverse;
 
-  // If _universeState already has Supabase data (loaded via loadSupabaseUniverse), use it directly
-  if (_universeState.universe && _universeState.universe.length > 440) {
+  // If _universeState already has Supabase/Upstox data, use it directly.
+  if (_universeState.universe && hasFullUniverse(_universeState.universe.length)) {
     ultraQuantCache.clear();
     multibaggerCache.clear();
     _cachedUniverse = _universeState.universe;
@@ -774,7 +794,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
 
   // Check if startServerlessApp pre-loaded Supabase universe into global
   const globalUniverse = (global as any).__supabaseUniverse as Array<{ symbol: string; sector: string; industry: string; marketCap: number; averageVolume: number }> | undefined;
-  if (globalUniverse && globalUniverse.length > 440) {
+  if (globalUniverse && hasFullUniverse(globalUniverse.length)) {
     const curatedMap = new Map(NSE_STOCK_UNIVERSE.map(s => [s.symbol, s]));
     _universeState.universe = globalUniverse.map(s => {
       const c = curatedMap.get(s.symbol);
@@ -1705,10 +1725,10 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     const cacheKey = JSON.stringify(request);
     const cached = ultraQuantCache.get(cacheKey);
     // Don't serve cached result if it was built on fallback universe
-    if (cached && cached.expiresAt > Date.now() && cached.universeSize > 440) return cached.payload;
+    if (cached && cached.expiresAt > Date.now() && hasFullUniverse(cached.universeSize)) return cached.payload;
 
-    // If universe is still at fallback size, wait up to 8s for Supabase to load
-    if (!_universeState.universe || _universeState.universe.length <= 440) {
+    // If universe is still at fallback size, wait up to 8s for Supabase/Upstox to load
+    if (!_universeState.universe || !hasFullUniverse(_universeState.universe.length)) {
       await Promise.race([
         loadSupabaseUniverse(8000),
         new Promise<void>(r => setTimeout(r, 8000)),
@@ -2186,7 +2206,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
           from += PAGE_SIZE;
           if (data.length < PAGE_SIZE) done = true;
         }
-        if (allRows.length > 440) {
+        if (hasFullUniverse(allRows.length)) {
           console.log(`[Universe] Serving ${allRows.length} stocks from Supabase`);
           return res.json(allRows.map(row => ({
             symbol:   row.symbol,
@@ -2202,7 +2222,7 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     }
     // Fallback to StockUniverseService
     const universe = await getUniverseAsync();
-    console.log(`[Universe] Serving ${universe.length} stocks (fallback)`);
+    console.log(`[Universe] Serving ${universe.length} stocks (${hasFullUniverse(universe.length) ? 'service' : 'fallback'})`);
     res.json(universe.map(s => ({
       symbol:   s.symbol,
       name:     s.name || s.symbol,
@@ -2219,7 +2239,8 @@ const createUltraQuantUniverse = (): UltraQuantProfile[] => {
     res.json({
       count: universe.length,
       supabaseDirectCount: supabaseCount,
-      source: universe.length > 440 ? 'supabase' : 'fallback',
+      source: hasFullUniverse(universe.length) ? 'full' : 'fallback',
+      minFullUniverseSize: FULL_UNIVERSE_MIN_SIZE,
       sample: universe.slice(0, 3).map(s => ({ symbol: s.symbol, name: s.name })),
     });
   });
@@ -4249,7 +4270,7 @@ Respond ONLY with this JSON structure (fill every field):
   const buildMultibaggerScan = async (cycleDays: MultibaggerCycle) => {
     const cached = multibaggerCache.get(cycleDays);
     // Don't serve cached result if it was built on fallback universe
-    if (cached && cached.expiresAt > Date.now() && cached.scannedUniverse > 440) return cached.payload;
+    if (cached && cached.expiresAt > Date.now() && hasFullUniverse(cached.scannedUniverse)) return cached.payload;
 
     const weights  = MB_CYCLE_WEIGHTS[cycleDays];
     const fullUniverse = createUltraQuantUniverse();

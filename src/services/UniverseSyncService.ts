@@ -38,7 +38,7 @@ interface UpstoxInstrument {
   security_type?: string;
 }
 
-interface CanonicalStock {
+export interface CanonicalStock {
   symbol: string;
   name: string;
   exchange: 'NSE' | 'BSE';
@@ -89,7 +89,16 @@ async function downloadInstruments(exchange: 'NSE' | 'BSE'): Promise<UpstoxInstr
 function filterEquity(instruments: UpstoxInstrument[], exchange: 'NSE' | 'BSE'): CanonicalStock[] {
   const segment = exchange === 'NSE' ? 'NSE_EQ' : 'BSE_EQ';
   return instruments
-    .filter(i =>
+    .filter(i => {
+      const symbol = i.trading_symbol?.trim() ?? '';
+      if (i.segment !== segment || !symbol) return false;
+      if (symbol.includes('-') || symbol.endsWith('BE') || symbol.endsWith('BL') || symbol.endsWith('GS')) return false;
+      if (exchange === 'NSE') {
+        return i.instrument_type === 'EQ' && (i.security_type === 'NORMAL' || !i.security_type);
+      }
+      return !['F', 'G'].includes(String(i.instrument_type)) && !/^\d/.test(symbol) && String(i.isin || '').startsWith('INE');
+    })
+    .filter(i => exchange === 'BSE' || (
       i.segment === segment &&
       i.instrument_type === 'EQ' &&
       i.trading_symbol &&
@@ -100,7 +109,7 @@ function filterEquity(instruments: UpstoxInstrument[], exchange: 'NSE' | 'BSE'):
       !i.trading_symbol.endsWith('BL') &&
       !i.trading_symbol.endsWith('GS') &&
       (i.security_type === 'NORMAL' || !i.security_type)
-    )
+    ))
     .map(i => ({
       symbol:         i.trading_symbol.trim().toUpperCase(),
       name:           i.name || i.short_name || i.trading_symbol,
@@ -108,6 +117,17 @@ function filterEquity(instruments: UpstoxInstrument[], exchange: 'NSE' | 'BSE'):
       instrument_key: i.instrument_key,
       isin:           i.isin || '',
     }));
+}
+
+export async function loadUpstoxEquityUniverse(): Promise<CanonicalStock[]> {
+  const [nseRaw, bseRaw] = await Promise.all([
+    downloadInstruments('NSE'),
+    downloadInstruments('BSE'),
+  ]);
+  const nseStocks = filterEquity(nseRaw, 'NSE');
+  const bseStocks = filterEquity(bseRaw, 'BSE');
+  console.log(`[UniverseSync] Upstox fallback universe: NSE=${nseStocks.length} BSE=${bseStocks.length}`);
+  return [...nseStocks, ...bseStocks];
 }
 
 // ── Main sync ─────────────────────────────────────────────────────────────────
@@ -140,12 +160,9 @@ export async function syncUniverseToSupabase(force = false): Promise<SyncResult>
   let bseStocks: CanonicalStock[] = [];
 
   try {
-    const [nseRaw, bseRaw] = await Promise.all([
-      downloadInstruments('NSE'),
-      downloadInstruments('BSE'),
-    ]);
-    nseStocks = filterEquity(nseRaw, 'NSE');
-    bseStocks = filterEquity(bseRaw, 'BSE');
+    const allStocks = await loadUpstoxEquityUniverse();
+    nseStocks = allStocks.filter(s => s.exchange === 'NSE');
+    bseStocks = allStocks.filter(s => s.exchange === 'BSE');
   } catch (e: any) {
     console.error('[UniverseSync] Download failed:', e.message);
     return { inserted: 0, deleted: 0, updated: 0, total: 0, skipped: true, reason: `Download failed: ${e.message}` };
